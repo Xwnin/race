@@ -1,0 +1,38 @@
+name: Test free no-account uncensored Spaces
+
+# One runner per Space (Hugging Face's anonymous GPU quota is per visitor). Read-only.
+on:
+  push:
+    paths:
+      - "remote/try_space.py"
+      - "remote/test_openai_space.py"
+      - ".github/workflows/test-free-spaces.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-openai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -u remote/test_openai_space.py https://rikunarita-org-qwen3-6-35b-a3b-uncensored-hauhau-3cbf2f6.hf.space
+  zerogpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        space:
+          - "Josssdiff/Huihui-Qwen3.6-35B-abliterated-chat /chat"
+          - "Anonimusman/QWEN-3.6-35B-A3B-ABLITERATED /predict"
+          - "markpaulm/gemma-4-31B-it-abliterated /chat"
+          - "ukung/Muse-Glimmer-30B-DFlash-Abliterated /chat"
+          - "JonathanColetti/Qwen3.8-27B-Uncensored-Demo /respond"
+          - "zk-Armor/qwen3.8-27b-uncensored-chatbot /chat"
+          - "FireDuckOnFire/dolphin-mistral-24b-venice /chat"
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -u remote/try_space.py ${{ matrix.space }}
