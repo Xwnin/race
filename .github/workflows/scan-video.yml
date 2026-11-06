@@ -1,0 +1,20 @@
+name: Scan free video generation Spaces
+
+on:
+  push:
+    paths:
+      - "remote/scan_video.py"
+      - "remote/try_video.py"
+      - ".github/workflows/scan-video.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -u remote/scan_video.py
