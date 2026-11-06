@@ -22,3 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -u remote/try_video.py "${{ matrix.space }}"
+      - run: sudo apt-get install -y -qq ffmpeg >/dev/null && for f in clips/*.mp4; do ffprobe -v error -show_entries stream=width,height,nb_frames,duration -of compact "$f"; ffmpeg -v error -ss 1 -i "$f" -frames:v 1 "${f%.mp4}.jpg"; done || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clip-${{ strategy.job-index }}
+          path: clips/
+          if-no-files-found: ignore
