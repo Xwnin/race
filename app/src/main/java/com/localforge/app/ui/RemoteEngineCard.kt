@@ -265,7 +265,7 @@ fun CloudEngineCard(vm: AppViewModel) {
                         Text((if (m.billions > 0) "${"%.0f".format(m.billions)}B · " else "") + "${m.ctx / 1024}k context",
                             color = C.Muted, fontSize = 12.sp)
                     }
-                    if (m.free) Tag("FREE", C.Bg, C.Good) else Tag("credit", C.Bg, C.Gold)
+                    if (m.free && vm.cloudBase.contains("huggingface")) Tag("free credit", C.Bg, C.Good) else if (m.free) Tag("FREE", C.Bg, C.Good) else Tag("credit", C.Bg, C.Gold)
                 }
             }
         }

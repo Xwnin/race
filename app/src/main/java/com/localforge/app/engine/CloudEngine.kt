@@ -16,6 +16,7 @@ object CloudEngine {
     data class Provider(val name: String, val base: String, val keyHint: String, val keyUrl: String)
 
     val PROVIDERS = listOf(
+        Provider("Hugging Face", "https://router.huggingface.co/v1", "hf_…", "https://huggingface.co/settings/tokens"),
         Provider("OpenRouter", "https://openrouter.ai/api/v1", "sk-or-…", "https://openrouter.ai/settings/keys"),
         Provider("Featherless", "https://api.featherless.ai/v1", "rc_…", "https://featherless.ai/account/api-keys"),
         Provider("NanoGPT", "https://nano-gpt.com/api/v1", "key", "https://nano-gpt.com/api"),
@@ -28,6 +29,16 @@ object CloudEngine {
         val billions: Double get() = Regex("(?<![a-z0-9.])(\\d+(?:\\.\\d+)?)b(?![a-z])", RegexOption.IGNORE_CASE)
             .findAll("$id $name").mapNotNull { it.groupValues[1].toDoubleOrNull() }.maxOrNull() ?: 0.0
     }
+
+    /**
+     * Abliterated 70B+ models Hugging Face serves through Featherless. A free Hugging Face account's monthly
+     * credit pays for them (a small amount), so they're the only big abliterated models usable for free.
+     */
+    private val HF_KNOWN = listOf(
+        "huihui-ai/Qwen2.5-72B-Instruct-abliterated", "zetasepic/Qwen2.5-72B-Instruct-abliterated-v2",
+        "huihui-ai/Llama-3.3-70B-Instruct-abliterated", "huihui-ai/DeepSeek-R1-Distill-Llama-70B-abliterated",
+        "failspy/Meta-Llama-3-70B-Instruct-abliterated-v3.5", "Guilherme34/Hermes-3-Llama-3.1-70B-Uncensored",
+    )
 
     /** Harsh's rule: the name or description must say uncensored or abliterated ("heretic" alone doesn't count). */
     private val UNCENSORED = Regex("uncensor|abliterat", RegexOption.IGNORE_CASE)
@@ -79,6 +90,10 @@ object CloudEngine {
 
     /** The provider's models that say uncensored or abliterated: free ones first, then biggest first. */
     suspend fun listModels(): List<CloudModel> = withContext(Dispatchers.IO) {
+        if (base.contains("router.huggingface.co")) {
+            if (key.isBlank()) throw IllegalStateException("Paste your Hugging Face token (hf_…) first.")
+            return@withContext HF_KNOWN.map { CloudModel("$it:featherless-ai", it.substringAfter('/'), 32768, true, "abliterated, via Featherless") }
+        }
         val c = open("/models")
         val code = c.responseCode
         val body = readAll(c); c.disconnect()
