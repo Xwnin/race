@@ -6,6 +6,7 @@ base = sys.argv[1].rstrip("/")
 UA = {"User-Agent": "LocalForge/1.0", "Content-Type": "application/json"}
 src = open(os.path.join(os.path.dirname(__file__), "test_horde.py")).read()
 ns = {}
+ns["__file__"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_horde.py")
 exec(src.split("SHORT_SYSTEM")[0], ns)   # only app_system_prompt() and imports
 SYSTEM = ns["app_system_prompt"]()
 PROMPTS = {
