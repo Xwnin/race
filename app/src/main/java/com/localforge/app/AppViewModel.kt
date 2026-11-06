@@ -1844,6 +1844,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         WebBrowser.init(app)
+        Engine.pool = BuildConfig.CLOUD
         if (useCloud && !prefs.getString("cloudModel", "").isNullOrBlank() && cloudKey.isNotBlank()) {
             CloudEngine.configure(cloudBase, cloudKey, prefs.getString("cloudModel", "")!!, prefs.getInt("cloudCtx", 8192))
             CloudEngine.ready = true

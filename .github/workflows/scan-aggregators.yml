@@ -7,6 +7,7 @@ on:
       - "remote/scan_aggregators.py"
       - "remote/scan_spaces.py"
       - "remote/probe_nokey.py"
+      - "remote/find_gguf.py"
       - ".github/workflows/scan-aggregators.yml"
   workflow_dispatch:
 
@@ -19,5 +20,4 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -u remote/probe_nokey.py
-      - run: python3 -u remote/scan_spaces.py
+      - run: python3 -u remote/find_gguf.py

@@ -133,6 +133,25 @@ object Engine {
         }
     }
 
+    /**
+     * Pool mode (LocalForge Cloud): when your own GPU (Modal) or cloud key fails, e.g. its free credit ran out or it's
+     * unreachable, the same reply is sent to the free uncensored Hugging Face Spaces instead.
+     */
+    @Volatile var pool: Boolean = false
+    /** Why the last reply came from the fallback (shown on screen), or null. */
+    @Volatile var lastFallback: String? = null
+        private set
+
+    private suspend fun fallback(
+        e: Exception, messages: List<ChatMessage>, maxTokens: Int, temperature: Float, prefill: String, onText: (String) -> Unit
+    ): String {
+        lastFallback = "${e.message} Using the free Hugging Face models for this reply."
+        SpaceEngine.onStatus(lastFallback)
+        val out = SpaceEngine.chat(messages, maxTokens, temperature, prefill, onText)
+        lastTokensPerSecond = SpaceEngine.lastTokensPerSecond
+        return out
+    }
+
     fun stop() {
         RemoteEngine.stop()
         HordeEngine.stop()
@@ -155,7 +174,8 @@ object Engine {
         onText: (String) -> Unit
     ): String {
         if (handle == 0L && CloudEngine.ready) {
-            val out = CloudEngine.chat(messages, maxTokens, temperature, prefill, onText)
+            val out = try { CloudEngine.chat(messages, maxTokens, temperature, prefill, onText) }
+                catch (e: IllegalStateException) { if (pool) return fallback(e, messages, maxTokens, temperature, prefill, onText) else throw e }
             lastTokensPerSecond = CloudEngine.lastTokensPerSecond
             return out
         }
@@ -173,9 +193,13 @@ object Engine {
             val t0 = System.nanoTime()
             var first = 0L
             var pieces = 0
-            val out = RemoteEngine.chat(messages, maxTokens, temperature, noThink, prefill) { p ->
-                if (pieces++ == 0) first = System.nanoTime()
-                onText(p)
+            val out = try {
+                RemoteEngine.chat(messages, maxTokens, temperature, noThink, prefill) { p ->
+                    if (pieces++ == 0) first = System.nanoTime()
+                    onText(p)
+                }
+            } catch (e: IllegalStateException) {
+                if (pool && pieces == 0) return fallback(e, messages, maxTokens, temperature, prefill, onText) else throw e
             }
             val secs = (System.nanoTime() - (if (first > 0) first else t0)) / 1e9
             lastTokensPerSecond = RemoteEngine.lastTokensPerSecond.takeIf { it > 0 } ?: if (pieces > 1 && secs > 0) (pieces - 1) / secs else 0.0
