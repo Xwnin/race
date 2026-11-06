@@ -1,0 +1,70 @@
+name: Build LocalForge Cloud APK
+
+on:
+  push:
+    paths-ignore:
+      - "remote/**"
+      - ".github/workflows/scan-aggregators.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch llama.cpp (pinned release b12025)
+        run: git clone --depth 1 --branch b12025 https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle :app:assembleCloudRelease :app:testCloudReleaseUnitTest --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Collect build errors
+        if: failure()
+        shell: bash
+        run: |
+          grep -nE "^e: |error:|FAILURE|What went wrong" -A3 build.log | head -150 > build-errors.txt || true
+          tail -80 build.log >> build-errors.txt || true
+
+      - name: Publish build errors
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cloud-build-log
+          name: Last failed build log
+          body: Errors from the last failed build (${{ github.sha }}).
+          files: build-errors.txt
+          prerelease: true
+          make_latest: false
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/cloud/release/app-cloud-release.apk LocalForge-Cloud.apk
+
+      - name: Publish LocalForge Cloud release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cloud-latest
+          name: LocalForge Cloud latest build
+          body: Built from commit ${{ github.sha }}. Download LocalForge-Cloud.apk below and open it on your phone.
+          files: LocalForge-Cloud.apk
+          make_latest: true

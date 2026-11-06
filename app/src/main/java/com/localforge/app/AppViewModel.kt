@@ -1,0 +1,1888 @@
+package com.localforge.app
+
+import android.app.Application
+import android.content.Context
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import org.json.JSONArray
+import org.json.JSONObject
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.localforge.app.agent.CodeRunner
+import com.localforge.app.agent.FileIndex
+import com.localforge.app.agent.TermuxBridge
+import com.localforge.app.agent.BrowserTools
+import com.localforge.app.agent.WebBrowser
+import com.localforge.app.agent.FileAction
+import com.localforge.app.agent.FileTools
+import com.localforge.app.data.DeviceInfo
+import com.localforge.app.data.Recommendation
+import com.localforge.app.data.formatBytes
+import com.localforge.app.data.HfFile
+import com.localforge.app.data.HfModel
+import com.localforge.app.data.HuggingFace
+import com.localforge.app.data.LocalModel
+import com.localforge.app.data.ModelStore
+import com.localforge.app.engine.ChatMessage
+import com.localforge.app.engine.Engine
+import com.localforge.app.engine.HordeEngine
+import com.localforge.app.engine.SpaceEngine
+import com.localforge.app.engine.CloudEngine
+import com.localforge.app.engine.RemoteEngine
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+
+enum class Tab { AUTOPILOT, HOME, MODELS, CODE, BROWSER, FILES }
+enum class Role { USER, ASSISTANT, TOOL, RUN, NOTE }
+enum class ActionStatus { PENDING, DONE, REJECTED }
+
+class PendingAction(val action: FileAction) {
+    var status by mutableStateOf(ActionStatus.PENDING)
+    var result by mutableStateOf<String?>(null)
+    /** Steps the model wrote after this card; they run once it's approved. */
+    var queued: List<FileAction> = emptyList()
+}
+
+class DownloadProgress(val file: HfFile) {
+    var done by mutableStateOf(0L)
+    var total by mutableStateOf(file.size)
+    var error by mutableStateOf<String?>(null)
+    var job: Job? = null
+}
+
+class UiMessage(val role: Role, initial: String, private val baseModelText: String? = null) {
+    /** Text the model sees instead of [text], if different. */
+    var modelTextOverride: String? = null
+    val modelText: String? get() = modelTextOverride ?: baseModelText
+    var text by mutableStateOf(initial)
+    var stats by mutableStateOf<String?>(null)
+    val actions = mutableStateListOf<PendingAction>()
+}
+
+class AppViewModel(app: Application) : AndroidViewModel(app) {
+    private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    val store = ModelStore(app)
+    private val main = Handler(Looper.getMainLooper())
+
+    var tab by mutableStateOf(if (BuildConfig.AUTOPILOT) Tab.AUTOPILOT else Tab.HOME)
+    var hasFileAccess by mutableStateOf(false)
+        private set
+
+    // ---- Settings ----
+    var nCtx by mutableStateOf(prefs.getInt("nCtx", 4096))
+        private set
+    var threads by mutableStateOf(prefs.getInt("threads2", defaultThreads()))
+        private set
+    var temperature by mutableStateOf(prefs.getFloat("temp", 0.3f))
+        private set
+    var maxTokens by mutableStateOf(prefs.getInt("maxTokens", 1024))
+        private set
+    var autoApprove by mutableStateOf(prefs.getBoolean("autoApprove", false))
+        private set
+    var hfToken by mutableStateOf(prefs.getString("hfToken", "") ?: "")
+        private set
+    // The 24/7 Autopilot runs unattended, so there the AI may click and type without asking (deletes still ask).
+    var browserAutoApprove by mutableStateOf(prefs.getBoolean("browserAutoApprove", BuildConfig.AUTOPILOT))
+        private set
+    /** Lets thinking models reason before answering. Off by default: on a phone it can take many minutes. */
+    var thinkHarder by mutableStateOf(prefs.getBoolean("thinkHarder2", !BuildConfig.AUTOPILOT))
+        private set
+    fun updateThinkHarder(v: Boolean) { thinkHarder = v; prefs.edit().putBoolean("thinkHarder2", v).apply() }
+
+    /** Live progress of the current request, shown while the AI works ("Step 2 · 1:05"). */
+    var requestStartedAt by mutableStateOf(0L)
+        private set
+    var stepNumber by mutableStateOf(0)
+        private set
+    /** Longest one reply may take, and how long a whole request may keep using tools, before the app steps in. */
+    // The Autopilot runs unattended, so a slow phone may take its time: nobody is waiting for the reply.
+    private val replyLimitMs get() = if (BuildConfig.AUTOPILOT) 20 * 60_000L else if (thinkHarder) 5 * 60_000L else 3 * 60_000L
+    /** Whole request: after this long the app forces the model to answer with what it has, then ends the turn. */
+    private val requestLimitMs get() = if (BuildConfig.AUTOPILOT) 45 * 60_000L else if (thinkHarder) 12 * 60_000L else 7 * 60_000L
+    /** Thinking budget: after this much hidden thinking the model must stop thinking and act. */
+    private val thinkTokenBudget = 600
+    private val thinkTimeBudgetMs = 2 * 60_000L
+    private var timeNudged = false
+    /** Never more than this many model replies for one request, however the tool steps juggle stepsLeft. */
+    private val maxRepliesPerRequest = 14
+    private var repliesThisRequest = 0
+    /** Fingerprints of recent replies and tool calls, to catch loops that aren't byte-for-byte identical. */
+    private val recentReplies = ArrayDeque<String>()
+    @Volatile private var deadlineHit = false
+    /** "Ask AI about this page": the chat as a sheet over the live page in the Browser tab. */
+    var pagePanelOpen by mutableStateOf(false)
+
+    fun updateCtx(v: Int) { nCtx = v; prefs.edit().putInt("nCtx", v).apply() }
+    fun updateThreads(v: Int) { threads = v; prefs.edit().putInt("threads2", v).apply() }
+    fun updateTemperature(v: Float) { temperature = v; prefs.edit().putFloat("temp", v).apply() }
+    fun updateMaxTokens(v: Int) { maxTokens = v; prefs.edit().putInt("maxTokens", v).apply() }
+    fun updateAutoApprove(v: Boolean) { autoApprove = v; prefs.edit().putBoolean("autoApprove", v).apply() }
+    fun updateBrowserAutoApprove(v: Boolean) { browserAutoApprove = v; prefs.edit().putBoolean("browserAutoApprove", v).apply() }
+    // ---- Remote engine: your own model on a rented GPU (remote/modal_engine.py) ----
+    var useRemote by mutableStateOf(prefs.getBoolean("useRemote", false))
+        private set
+    var remoteUrl by mutableStateOf(prefs.getString("remoteUrl", "") ?: "")
+        private set
+    var remoteKey by mutableStateOf(prefs.getString("remoteKey", "") ?: "")
+        private set
+    var remoteBusy by mutableStateOf(false)
+        private set
+
+    private fun remoteName() = "☁ " + RemoteEngine.model.ifBlank { "remote model" }
+
+    /** Checks the address and key (waking the GPU if needed) and uses the remote model for every chat. */
+    fun connectRemote(url: String, key: String) {
+        if (remoteBusy) return
+        remoteBusy = true
+        viewModelScope.launch { stopReplyForSwitch(); connectRemoteNow(url, key); remoteBusy = false }
+    }
+
+    private suspend fun connectRemoteNow(url: String, key: String): Boolean {
+        remoteUrl = url.trim().trimEnd('/'); remoteKey = key.trim()
+        prefs.edit().putString("remoteUrl", remoteUrl).putString("remoteKey", remoteKey).apply()
+        engineMessage = "Connecting to the remote engine (a sleeping GPU takes a minute or two to wake)…"
+        RemoteEngine.ready = false
+        RemoteEngine.configure(remoteUrl, remoteKey)
+        return try {
+            if (useHorde) stopHorde()
+            if (useSpace) stopSpace()
+            if (useCloud) stopCloud()
+            if (Engine.isLoaded) Engine.unload()
+            val name = RemoteEngine.connect()
+            useRemote = true
+            prefs.edit().putBoolean("useRemote", true).putString("remoteModel", name).putInt("remoteCtx", RemoteEngine.ctx).apply()
+            loadedModel = remoteName()
+            engineMessage = "Remote engine ready: $name (${RemoteEngine.ctx} tokens of context)"
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            RemoteEngine.ready = false
+            loadedModel = null
+            engineMessage = e.message ?: "Couldn't reach the remote engine."
+            false
+        }
+    }
+
+    // ---- AI Horde: free volunteer GPUs, no account (prompts aren't private) ----
+    var useHorde by mutableStateOf(prefs.getBoolean("useHorde", false))
+        private set
+    var hordeKey by mutableStateOf(prefs.getString("hordeKey", "") ?: "")
+        private set
+    val hordeModels = mutableStateListOf<HordeEngine.HordeModel>()
+    var hordeBusy by mutableStateOf(false)
+        private set
+    var hordeMessage by mutableStateOf<String?>(null)
+        private set
+
+    /** Reads which models AI Horde's volunteers are serving right now. */
+    fun fetchHordeModels() {
+        if (hordeBusy) return
+        hordeBusy = true
+        hordeMessage = "Asking AI Horde which models are online…"
+        viewModelScope.launch {
+            try {
+                val list = HordeEngine.listModels()
+                hordeModels.clear(); hordeModels.addAll(list)
+                hordeMessage = if (list.isEmpty()) "None of the tested uncensored 20B+ models are online on AI Horde right now. Try again later." else null
+            } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+                hordeMessage = e.message ?: "Couldn't reach AI Horde."
+            } finally { hordeBusy = false }
+        }
+    }
+
+    /** Uses [m] on AI Horde for every chat (and the Autopilot). */
+    fun useHordeModel(m: HordeEngine.HordeModel, key: String) {
+        if (hordeBusy) return
+        hordeBusy = true
+        hordeMessage = "Switching to ${m.short}…"
+        viewModelScope.launch {
+            try { switchToHorde(m, key) } finally { hordeBusy = false }
+        }
+    }
+
+    /** Stops a reply that's still being written (e.g. an Autopilot round on the phone's model), so the engine can change. */
+    private suspend fun stopReplyForSwitch() {
+        if (!generating) return
+        stopGenerating()
+        val until = System.currentTimeMillis() + 20_000
+        while (generating && System.currentTimeMillis() < until) delay(200)
+    }
+
+    private suspend fun switchToHorde(m: HordeEngine.HordeModel, key: String) {
+        run {
+            stopReplyForSwitch()
+            if (useRemote) disconnectRemote()
+            if (useSpace) stopSpace()
+            if (useCloud) stopCloud()
+            if (Engine.isLoaded && !Engine.isHorde) Engine.unload()
+            hordeKey = key.trim()
+            HordeEngine.use(m, hordeKey)
+            useHorde = true
+            prefs.edit().putBoolean("useHorde", true).putString("hordeKey", hordeKey).putString("hordeModel", m.name)
+                .putInt("hordeCtx", HordeEngine.ctx).putInt("hordeReply", HordeEngine.maxReply).apply()
+            loadedModel = "🌐 " + m.short
+            engineMessage = "Using ${m.short} on AI Horde (${HordeEngine.ctx} tokens of context)"
+            hordeMessage = "Ready: every chat now uses ${m.short}."
+        }
+    }
+
+    // ---- Uncensored Gemma 31B on a public Hugging Face Space (free, no account; a free HF token gives more replies) ----
+    var useSpace by mutableStateOf(prefs.getBoolean("useSpace", false))
+        private set
+    var spaceBusy by mutableStateOf(false)
+        private set
+    var spaceMessage by mutableStateOf<String?>(null)
+        private set
+
+    fun useSpaceEngine() {
+        if (spaceBusy) return
+        spaceBusy = true
+        spaceMessage = "Connecting to the Hugging Face Space (it can take a minute to wake up)…"
+        viewModelScope.launch {
+            try {
+                stopReplyForSwitch()
+                if (useRemote) disconnectRemote()
+                if (useHorde) stopHorde()
+                if (useCloud) stopCloud()
+                if (Engine.isLoaded && !Engine.isSpace) Engine.unload()
+                SpaceEngine.token = hfToken
+                SpaceEngine.connect()
+                useSpace = true
+                prefs.edit().putBoolean("useSpace", true).apply()
+                loadedModel = "🤗 " + SpaceEngine.MODEL
+                engineMessage = "Using ${SpaceEngine.MODEL} on Hugging Face (free)"
+                spaceMessage = "Ready: every chat now uses ${SpaceEngine.MODEL}." +
+                    if (hfToken.isBlank()) " Without a Hugging Face token you get a few replies at a time." else ""
+            } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+                SpaceEngine.ready = false
+                spaceMessage = e.message ?: "Couldn't reach the Hugging Face Space."
+            } finally { spaceBusy = false }
+        }
+    }
+
+    fun stopSpace() {
+        SpaceEngine.stop()
+        SpaceEngine.ready = false
+        useSpace = false
+        prefs.edit().putBoolean("useSpace", false).apply()
+        if (loadedModel?.startsWith("🤗") == true) loadedModel = null
+        spaceMessage = null
+    }
+
+    // ---- Cloud aggregators (OpenRouter, Featherless…) with your own key: only uncensored/abliterated models ----
+    var useCloud by mutableStateOf(prefs.getBoolean("useCloud", false))
+        private set
+    var cloudBase by mutableStateOf(prefs.getString("cloudBase", CloudEngine.PROVIDERS[0].base) ?: CloudEngine.PROVIDERS[0].base)
+        private set
+    var cloudKey by mutableStateOf(prefs.getString("cloudKey", "") ?: "")
+        private set
+    val cloudModels = mutableStateListOf<CloudEngine.CloudModel>()
+    var cloudBusy by mutableStateOf(false)
+        private set
+    var cloudMessage by mutableStateOf<String?>(null)
+        private set
+
+    fun setCloudProvider(base: String) {
+        if (base == cloudBase) return
+        cloudBase = base; cloudModels.clear(); cloudMessage = null
+        prefs.edit().putString("cloudBase", base).apply()
+    }
+
+    fun updateCloudKey(v: String) { cloudKey = v.trim(); prefs.edit().putString("cloudKey", cloudKey).apply() }
+
+    /** Asks the provider which uncensored/abliterated models it serves. */
+    fun fetchCloudModels() {
+        if (cloudBusy) return
+        cloudBusy = true
+        cloudMessage = "Asking ${CloudEngine.PROVIDERS.firstOrNull { it.base == cloudBase }?.name ?: "the service"} for its uncensored models…"
+        viewModelScope.launch {
+            try {
+                if (!useCloud) CloudEngine.configure(cloudBase, cloudKey)
+                val list = CloudEngine.listModels()
+                cloudModels.clear(); cloudModels.addAll(list)
+                cloudMessage = if (list.isEmpty()) "This service has no model labelled uncensored or abliterated right now." else null
+            } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+                cloudMessage = e.message ?: "Couldn't reach the service."
+            } finally { cloudBusy = false }
+        }
+    }
+
+    /** Uses [m] for every chat and the Autopilot. */
+    fun useCloudModel(m: CloudEngine.CloudModel) {
+        if (cloudBusy) return
+        if (cloudKey.isBlank()) { cloudMessage = "Paste your key first."; return }
+        cloudBusy = true
+        viewModelScope.launch {
+            try {
+                stopReplyForSwitch()
+                if (useRemote) disconnectRemote()
+                if (useHorde) stopHorde()
+                if (useSpace) stopSpace()
+                if (Engine.isLoaded && !Engine.isCloud) Engine.unload()
+                CloudEngine.configure(cloudBase, cloudKey)
+                CloudEngine.use(m)
+                useCloud = true
+                prefs.edit().putBoolean("useCloud", true).putString("cloudModel", m.id).putInt("cloudCtx", CloudEngine.ctx).apply()
+                loadedModel = "☁ " + m.short
+                engineMessage = "Using ${m.short} on ${CloudEngine.providerName}"
+                cloudMessage = "Ready: every chat now uses ${m.short}."
+            } finally { cloudBusy = false }
+        }
+    }
+
+    fun stopCloud() {
+        CloudEngine.stop()
+        CloudEngine.ready = false
+        useCloud = false
+        prefs.edit().putBoolean("useCloud", false).apply()
+        if (loadedModel?.startsWith("☁") == true && !useRemote) loadedModel = null
+        cloudMessage = null
+    }
+
+    fun stopHorde() {
+        HordeEngine.stop()
+        HordeEngine.ready = false
+        useHorde = false
+        prefs.edit().putBoolean("useHorde", false).apply()
+        if (loadedModel?.startsWith("🌐") == true) loadedModel = null
+    }
+
+    /** Back to models on the phone. The remote GPU scales down by itself. */
+    fun disconnectRemote() {
+        RemoteEngine.stop()
+        RemoteEngine.ready = false
+        useRemote = false
+        prefs.edit().putBoolean("useRemote", false).apply()
+        if (loadedModel?.startsWith("☁") == true) loadedModel = null
+        engineMessage = "Remote engine off: chats use models on this phone again."
+    }
+
+    private suspend fun wakeRemote() {
+        if (!Engine.isRemote || !RemoteEngine.asleep()) return
+        loading = true
+        engineMessage = "Waking the remote GPU (a minute or two after a quiet spell)…"
+        RemoteEngine.clearStop()
+        try { RemoteEngine.waitReady(); engineMessage = "Remote engine ready: ${RemoteEngine.model}" }
+        finally { loading = false }
+    }
+
+    fun updateHfToken(v: String) { hfToken = v.trim(); SpaceEngine.token = hfToken; prefs.edit().putString("hfToken", hfToken).apply() }
+
+    // Phones have 4 fast cores at most; using the slow ones too makes generation slower, not faster.
+    private fun defaultThreads(): Int = Runtime.getRuntime().availableProcessors().coerceAtMost(4).coerceAtLeast(2)
+
+    // ---- Models ----
+    val localModels = mutableStateListOf<LocalModel>()
+    /** Active or failed downloads, keyed by file name. */
+    val downloads = mutableStateMapOf<String, DownloadProgress>()
+    var loadedModel by mutableStateOf<String?>(null)
+        private set
+    var loading by mutableStateOf(false)
+        private set
+    var engineMessage by mutableStateOf<String?>(null)
+
+    var searchQuery by mutableStateOf("")
+    val searchResults = mutableStateListOf<HfModel>()
+    var searching by mutableStateOf(false)
+        private set
+    var searchError by mutableStateOf<String?>(null)
+        private set
+    var openRepo by mutableStateOf<String?>(null)
+        private set
+    val repoFiles = mutableStateListOf<HfFile>()
+    var repoLoading by mutableStateOf(false)
+        private set
+
+    // ---- Phone scan + recommendations ----
+    var device by mutableStateOf<DeviceInfo?>(null)
+        private set
+    val recommendations = mutableStateListOf<Recommendation>()
+    var scanning by mutableStateOf(false)
+        private set
+    var scanSummary by mutableStateOf<String?>(null)
+        private set
+
+    fun refreshPermission() {
+        hasFileAccess = Environment.isExternalStorageManager()
+        if (hasFileAccess && entries.isEmpty()) refreshFiles()
+        if (hasFileAccess) viewModelScope.launch { try { FileIndex.ensureFresh() } catch (_: Exception) {} }
+        if (hasFileAccess) shareModels()
+    }
+
+    private var sharing = false
+
+    /** Puts models in /sdcard/LocalForge/models so LocalForge and LocalForge Autopilot both use the same files. */
+    private fun shareModels() {
+        if (sharing) return
+        sharing = true
+        viewModelScope.launch {
+            try {
+                val n = store.shareModels(Engine.loadedPath)
+                if (n > 0) {
+                    refreshModels()
+                    if (!loading) engineMessage = "Moved $n model(s) to the shared folder LocalForge/models, so both LocalForge apps can use them."
+                }
+            } catch (_: Exception) {
+            } finally {
+                sharing = false
+            }
+        }
+    }
+
+    fun refreshModels() {
+        localModels.clear()
+        localModels.addAll(store.localModels())
+    }
+
+    fun scanPhone() {
+        if (scanning) return
+        viewModelScope.launch {
+            scanning = true
+            scanSummary = "Scanning your phone…"
+            try {
+                val d = withContext(Dispatchers.IO) { store.deviceInfo() }
+                device = d
+                val found = if (hasFileAccess) store.scanPhone() else -1
+                refreshModels()
+                scanSummary = (if (found >= 0) "Found $found uncensored model file(s) already on your phone. " else "Allow all-files access to also find models already on your phone. ") +
+                    "Finding the best uncensored models for ${formatBytes(d.totalRam)} RAM…"
+                val recs = HuggingFace.recommend(d, hfToken, coding = true)
+                recommendations.clear()
+                recommendations.addAll(recs)
+                scanSummary = (if (found >= 0) "Found $found uncensored model file(s) on your phone. " else "") +
+                    if (recs.isEmpty()) "Couldn't reach Hugging Face or nothing fits — check your connection." else "Top picks for your phone are below."
+            } catch (e: Exception) {
+                scanSummary = "Scan failed: ${e.message}"
+            } finally {
+                scanning = false
+            }
+        }
+    }
+
+    fun search(query: String = searchQuery) {
+        searchQuery = query
+        viewModelScope.launch {
+            searching = true
+            searchError = null
+            openRepo = null
+            try {
+                val r = HuggingFace.search(query, hfToken)
+                searchResults.clear()
+                searchResults.addAll(r)
+                if (r.isEmpty()) searchError = "No uncensored GGUF models found for \"$query\""
+            } catch (e: Exception) {
+                searchError = "Search failed: ${e.message}"
+            } finally {
+                searching = false
+            }
+        }
+    }
+
+    fun selectRepo(id: String?) {
+        openRepo = id
+        repoFiles.clear()
+        if (id == null) return
+        viewModelScope.launch {
+            repoLoading = true
+            try {
+                repoFiles.addAll(HuggingFace.ggufFiles(id, hfToken))
+                if (repoFiles.isEmpty()) searchError = "No single-file GGUF models in $id"
+            } catch (e: Exception) {
+                searchError = "Couldn't list files: ${e.message}"
+            } finally {
+                repoLoading = false
+            }
+        }
+    }
+
+    fun download(file: HfFile) {
+        val existing = downloads[file.fileName]
+        if (existing != null && existing.job?.isActive == true) return
+        val free = store.deviceInfo().freeStorage
+        if (file.size > 0 && file.size > free - 200L * 1024 * 1024) {
+            engineMessage = "Not enough free storage for ${file.fileName} (${formatBytes(file.size)} needed, ${formatBytes(free)} free)."
+            return
+        }
+        val p = DownloadProgress(file)
+        downloads[file.fileName] = p
+        engineMessage = "Downloading ${file.fileName}"
+        p.job = viewModelScope.launch {
+            try {
+                store.download(file, hfToken) { done, total ->
+                    main.post { p.done = done; p.total = total }
+                }
+                downloads.remove(file.fileName)
+                refreshModels()
+                engineMessage = "Downloaded ${file.fileName}. Load it on the Home tab."
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                p.error = e.message ?: "Download failed"
+            }
+        }
+    }
+
+    fun cancelDownload(name: String) {
+        downloads[name]?.job?.cancel()
+        downloads.remove(name)
+        store.partFile(name).delete()
+    }
+
+    fun deleteModel(m: LocalModel) {
+        viewModelScope.launch {
+            if (loadedModel == m.name) unloadModel()
+            store.delete(m)
+            refreshModels()
+        }
+    }
+
+    fun loadModel(m: LocalModel) {
+        if (loading) return
+        viewModelScope.launch { loadModelNow(m) }
+    }
+
+    /** Loads a model and waits until it's ready. Returns true on success. */
+    private suspend fun loadModelNow(m: LocalModel): Boolean {
+        if (useRemote) disconnectRemote()
+        if (useHorde) stopHorde()
+        if (useSpace) stopSpace()
+        if (useCloud) stopCloud()
+        loading = true
+        engineMessage = "Loading ${m.name}…"
+        var err: String? = null
+        val ok = try {
+            Engine.load(m.file.absolutePath, nCtx, threads, getApplication<Application>().applicationInfo.nativeLibraryDir)
+        } catch (e: CancellationException) {
+            loading = false
+            throw e
+        } catch (e: Throwable) {
+            err = e.message
+            false
+        }
+        loading = false
+        if (ok) {
+            loadedModel = m.name
+            engineMessage = "${m.name} is ready"
+            prefs.edit().putString("lastModel", m.name).apply()
+        } else {
+            loadedModel = null
+            engineMessage = err ?: "Couldn't load ${m.name}. It may be too big for this phone's memory or not a valid GGUF."
+        }
+        return ok
+    }
+
+    /** [keepRemote]: the Autopilot stopping leaves the remote engine set up (its GPU scales down by itself). */
+    fun unloadModel(keepRemote: Boolean = false) {
+        if (Engine.isCloud) {
+            if (!keepRemote) stopCloud() else CloudEngine.stop()
+            return
+        }
+        if (Engine.isSpace) {
+            if (!keepRemote) stopSpace() else SpaceEngine.stop()
+            return
+        }
+        if (Engine.isHorde) {
+            if (!keepRemote) stopHorde() else HordeEngine.stop()
+            return
+        }
+        if (Engine.isRemote) {
+            if (!keepRemote) disconnectRemote() else RemoteEngine.stop()
+            return
+        }
+        viewModelScope.launch {
+            Engine.unload()
+            loadedModel = null
+            engineMessage = "Model unloaded"
+        }
+    }
+
+    val lastModelName: String? get() = prefs.getString("lastModel", null)
+
+    // ---- Code assistant ----
+    val messages = mutableStateListOf<UiMessage>()
+    var input by mutableStateOf("")
+    var attachment by mutableStateOf<File?>(null)
+    var generating by mutableStateOf(false)
+        private set
+    private var genJob: Job? = null
+
+    val workspaceRoot: String get() = Environment.getExternalStorageDirectory().absolutePath
+
+    fun attachFile(file: File) {
+        attachment = file
+        if (input.isBlank()) input = "Explain this file and suggest improvements."
+        tab = Tab.CODE
+    }
+
+    fun clearChat() {
+        if (generating) return
+        messages.clear()
+        try { chatFile.delete() } catch (_: Exception) {}
+    }
+
+    @Volatile private var stopRequested = false
+
+    fun stopGenerating() {
+        stopRequested = true
+        Engine.stop()
+    }
+
+    /** [onPage]: asked from the panel over the browser, so the question is about the page that's open. */
+    fun send(onPage: Boolean = false) {
+        val text = input.trim()
+        if (text.isEmpty() || generating || loading) return
+        if (Engine.isRemote && RemoteEngine.asleep()) {
+            viewModelScope.launch {
+                try { wakeRemote(); send(onPage) }
+                catch (e: CancellationException) { throw e }
+                catch (e: Throwable) { messages += UiMessage(Role.NOTE, e.message ?: "The remote engine didn't wake up.") }
+            }
+            return
+        }
+        if (!Engine.isLoaded && useRemote && remoteUrl.isNotBlank()) {
+            viewModelScope.launch {
+                messages += UiMessage(Role.NOTE, "Connecting to the remote engine…")
+                loading = true
+                val ok = try { connectRemoteNow(remoteUrl, remoteKey) } finally { loading = false }
+                if (ok) send(onPage) else messages.add(UiMessage(Role.NOTE, engineMessage ?: "Couldn't reach the remote engine."))
+            }
+            return
+        }
+        if (!Engine.isLoaded) {
+            // The model is unloaded if Android restarted the app; reload the last one automatically.
+            val last = localModels.firstOrNull { it.name == lastModelName } ?: localModels.singleOrNull()
+            if (last == null) {
+                messages += UiMessage(Role.NOTE, "Load a model on the Home tab first.")
+                return
+            }
+            viewModelScope.launch {
+                messages += UiMessage(Role.NOTE, "Loading ${last.name.removeSuffix(".gguf")}…")
+                if (loadModelNow(last)) {
+                    send(onPage)
+                } else {
+                    messages.add(UiMessage(Role.NOTE, engineMessage ?: "Couldn't load the model."))
+                }
+            }
+            return
+        }
+        val att = attachment
+        var modelText: String? = null
+        var display = text
+        if (att != null) {
+            val body = try {
+                att.bufferedReader().use { r ->
+                    val buf = CharArray(12_000)
+                    val n = r.read(buf)
+                    if (n > 0) String(buf, 0, n) else ""
+                }
+            } catch (e: Exception) {
+                "(couldn't read file: ${e.message})"
+            }
+            modelText = "$text\n\nFile ${att.absolutePath}:\n```\n$body\n```"
+            display = "📎 ${att.name}\n$text"
+        }
+        if (onPage && WebBrowser.hasPage) {
+            modelText = "[I'm looking at this page in your browser: \"${WebBrowser.title}\" ${WebBrowser.url}. " +
+                "My request is about it. If I ask you to open/click something, read the page with <page/> and click it first; " +
+                "for data, use <extract/>. Then click/type on it as needed.]\n" + (modelText ?: text)
+        }
+        input = ""
+        attachment = null
+        val userMsg = UiMessage(Role.USER, display, modelText)
+        messages += userMsg
+        stepsLeft = 10
+        totalSteps = 0
+        resetRequestState()
+        requestStartedAt = System.currentTimeMillis()
+        timeNudged = false
+        if (onPage && WebBrowser.hasPage) {
+            // Small models often skip reading the page or write broken tags: the app reads it first and hands it over.
+            viewModelScope.launch {
+                generating = true
+                val ctx = try { pageContext(text) } catch (e: Exception) { null } finally { generating = false; WebBrowser.step = null }
+                if (!ctx.isNullOrBlank()) messages += UiMessage(Role.TOOL, ctx)
+                runAgent()
+            }
+            return
+        }
+        if (onPage || webWords.containsMatchIn(text) || !looksLikeFileRequest(text)) {
+            runAgent()
+            return
+        }
+        if (!hasFileAccess) {
+            messages += UiMessage(Role.NOTE, "To let the AI see your files, allow all-files access: Home → checklist → Allow all-files access.")
+            runAgent()
+            return
+        }
+        // Small models rarely explore files on their own, so the app looks first and hands over the results.
+        viewModelScope.launch {
+            generating = true
+            val ctx = try {
+                withContext(Dispatchers.IO) { gatherFileContext(text) }
+            } catch (e: Exception) {
+                null
+            } finally {
+                generating = false
+            }
+            if (!ctx.isNullOrBlank()) {
+                userMsg.modelTextOverride = (modelText ?: text) + "\n\n[Phone files — found automatically by the app]\n" + ctx
+                messages += UiMessage(Role.TOOL, ctx)
+            }
+            runAgent()
+        }
+    }
+
+    // ---- Autopilot hooks (LocalForge Autopilot drives the normal chat loop, one round at a time) ----
+
+    /** Starts one request with a prompt written by the app. Returns false if the AI is busy. */
+    fun sendAuto(prompt: String, display: String): Boolean {
+        if (generating || loading || !Engine.isLoaded) return false
+        messages += UiMessage(Role.USER, display, prompt)
+        stepsLeft = 10
+        totalSteps = 0
+        resetRequestState()
+        requestStartedAt = System.currentTimeMillis()
+        timeNudged = false
+        runAgent()
+        return true
+    }
+
+    /** Loads [name] (or the last used / only model) and waits. Returns true when a model is ready. */
+    suspend fun ensureModel(name: String?): Boolean {
+        if (useCloud) {
+            if (!CloudEngine.ready) {
+                CloudEngine.configure(cloudBase, cloudKey, prefs.getString("cloudModel", "") ?: "", prefs.getInt("cloudCtx", 8192))
+                CloudEngine.ready = CloudEngine.model.isNotBlank() && cloudKey.isNotBlank()
+            }
+            return CloudEngine.ready
+        }
+        if (useSpace) {
+            SpaceEngine.token = hfToken
+            if (!SpaceEngine.ready) SpaceEngine.ready = true
+            return true
+        }
+        if (useHorde) {
+            if (!HordeEngine.ready) {
+                HordeEngine.configure(prefs.getString("hordeModel", "") ?: "", hordeKey, prefs.getInt("hordeCtx", 4096), prefs.getInt("hordeReply", 512))
+                HordeEngine.ready = HordeEngine.model.isNotBlank()
+            }
+            return HordeEngine.ready
+        }
+        if (useRemote) {
+            if (loading || remoteBusy) return false
+            if (!Engine.isRemote) {
+                loading = true
+                val ok = try { connectRemoteNow(remoteUrl, remoteKey) } finally { loading = false }
+                if (!ok) return false
+            }
+            return try { wakeRemote(); true } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+                engineMessage = e.message; false
+            }
+        }
+        if (Engine.isLoaded && (name == null || loadedModel == name)) return true
+        refreshModels()
+        val pick = localModels.firstOrNull { it.name == name } ?: localModels.firstOrNull { it.name == lastModelName }
+            ?: localModels.singleOrNull() ?: return false
+        if (Engine.isLoaded && loadedModel == pick.name) return true
+        if (loading) return false
+        return loadModelNow(pick)
+    }
+
+    /** An approval card is waiting in the chat. */
+    fun hasPendingCard(): Boolean = messages.takeLast(10).any { m -> m.actions.any { it.status == ActionStatus.PENDING } }
+
+    /** A 24/7 chat would grow forever: the Autopilot's memory keeps what matters, so drop the oldest messages. */
+    fun pruneMessages(keep: Int) {
+        if (generating || messages.size <= keep) return
+        repeat(messages.size - keep) { messages.removeAt(0) }
+        saveChat()
+    }
+
+    private val fileWords = Regex(
+        "\\b(file|files|folder|folders|director(y|ies)|storage|download|downloads|document|documents|photo|photos|picture|pictures|" +
+            "image|images|screenshot|screenshots|video|videos|music|song|songs|audio|pdf|pdfs|apk|apks|zip|dcim|camera|whatsapp|" +
+            "find|search|locate|where|list|open|read|show me|look in|in my|on my phone|sdcard|internal)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun looksLikeFileRequest(text: String): Boolean =
+        fileWords.containsMatchIn(text) || text.contains("/storage/") || Regex("\\.[a-z0-9]{2,5}\\b").containsMatchIn(text.lowercase())
+
+    /** The open page (text + numbered elements), plus its tables/lists when the question is about data. */
+    private suspend fun pageContext(question: String): String {
+        WebBrowser.step = "📖 Reading the page"
+        val wantsData = dataWords.containsMatchIn(question)
+        val parts = mutableListOf(WebBrowser.describe(if (wantsData) 1000 else 1600))
+        doneLookups += "page|||" + WebBrowser.url
+        if (wantsData) {
+            val ex = WebBrowser.extract(question.take(120))
+            if (!ex.startsWith("No tables")) {
+                parts += "Data on the page (tables and repeated lists as rows; ▲/▼ = up/down shown by colour). " +
+                    "To open a row's link use <click row=\"N\"/>:\n" + ex.take(2200)
+                doneLookups += "extract|||" + WebBrowser.url
+            }
+        }
+        return parts.joinToString("\n\n")
+    }
+
+    /** Finds what the user is talking about: explicit paths, named folders, and index matches. */
+    private suspend fun gatherFileContext(text: String): String {
+        FileIndex.ensureFresh()
+        val root = Environment.getExternalStorageDirectory()
+        val parts = mutableListOf<String>()
+        val used = mutableSetOf<String>()
+
+        // 1) Full paths in the message: list folders, read files.
+        for (m in Regex("/storage/[^\\s\"'`]+").findAll(text)) {
+            val f = File(m.value.trimEnd('.', ',', ')', '?', '!'))
+            if (!used.add(f.absolutePath)) continue
+            when {
+                f.isDirectory -> parts += FileTools.execute(FileAction.ListDir(f.absolutePath))
+                f.isFile -> parts += FileTools.execute(FileAction.Read(f.absolutePath))
+            }
+        }
+
+        // 2) Top-level folders mentioned by name ("my Download folder", "DCIM", "documents").
+        val lower = text.lowercase()
+        root.listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }?.forEach { d ->
+            val n = d.name.lowercase()
+            val mentioned = Regex("\\b${Regex.escape(n)}s?\\b").containsMatchIn(lower) ||
+                (n == "download" && lower.contains("downloads")) || (n == "dcim" && lower.contains("camera"))
+            if (mentioned && used.add(d.absolutePath)) parts += FileTools.execute(FileAction.ListDir(d.absolutePath))
+        }
+
+        // 3) Whole-phone search by name / type.
+        val hits = FileIndex.search(text, 25).filter { it.path !in used }
+        if (hits.isNotEmpty()) parts += "Best matches on the phone:\n" + FileIndex.format(hits)
+
+        // 4) Nothing specific: give an overview so the model at least knows what's there.
+        if (parts.isEmpty()) {
+            parts += "Phone storage ($root) top-level folders: " + FileIndex.overview()
+        }
+        return parts.joinToString("\n\n").take(9000)
+    }
+
+    /** Folder where the assistant's code runs: /LocalForge on phone storage, or the app's own folder. */
+    private fun runDir(): File =
+        if (hasFileAccess) File(Environment.getExternalStorageDirectory(), "LocalForge")
+        else (getApplication<Application>().getExternalFilesDir("run") ?: File(getApplication<Application>().filesDir, "run"))
+
+    // ---- Code runners ----
+    var termuxInstalled by mutableStateOf(false)
+        private set
+    var termuxAllowed by mutableStateOf(false)
+        private set
+    var runnerMessage by mutableStateOf<String?>(null)
+    /** HTML page the assistant (or the user) ran, shown full-screen. */
+    var htmlPreview by mutableStateOf<File?>(null)
+
+    fun refreshTermux() {
+        val ctx = getApplication<Application>()
+        termuxInstalled = TermuxBridge.isInstalled(ctx)
+        termuxAllowed = TermuxBridge.hasPermission(ctx)
+    }
+
+    fun availableLanguages(): List<String> {
+        val termux = termuxInstalled && termuxAllowed && hasFileAccess
+        return if (termux) {
+            listOf("python", "javascript", "typescript", "html", "sql", "shell", "c", "cpp", "java", "kotlin", "go", "rust", "ruby", "php", "lua", "perl", "bash")
+        } else {
+            listOf(
+                "python", "javascript", "typescript", "html", "sql", "shell", "lua", "ruby",
+                "php (basic: no printf)", "c / cpp (simple interpreter: use arrays, printf and cout only — no vector, map or std::string)"
+            )
+        }
+    }
+
+    /** Quick check that Termux answers and which compilers are installed. */
+    fun testTermux() {
+        viewModelScope.launch {
+            runnerMessage = "Testing Termux…"
+            val r = CodeRunner.run(
+                getApplication<Application>(), "bash",
+                "for t in clang go rustc java kotlinc ruby php lua5.4 perl node; do if command -v \$t >/dev/null; then echo \"✓ \$t\"; else echo \"✗ \$t (missing)\"; fi; done",
+                runDir()
+            )
+            runnerMessage = if (r.ok) "Termux works!\n${r.output}" else r.output
+        }
+    }
+
+    /** Model turns left for the current request (each run/read result triggers another turn). */
+    private var stepsLeft = 0
+
+    /**
+     * The conversation as the model sees it, fitted to the context window by real token counts.
+     * The current request (the latest user message and everything after it) always comes first. Older turns
+     * are then added newest-first: in full detail while there's room, shortened when room runs low, and
+     * whatever still doesn't fit is replaced by a short list of what the user asked earlier, so the model
+     * never forgets the conversation outright.
+     */
+    private fun history(): List<ChatMessage> {
+        val overview = if (hasFileAccess) FileIndex.overview().ifBlank { "(not indexed yet)" } else "(no access yet — the user must allow all-files access on the Home tab)"
+        val sys = FileTools.systemPrompt(workspaceRoot, runDir().absolutePath, availableLanguages(), overview)
+        val ctx = Engine.contextSize().takeIf { it > 0 } ?: nCtx
+        val replyRoom = minOf(maxTokens, maxOf(384, ctx / 3))
+        // Each message costs a few template tokens on top of its text.
+        fun cost(c: ChatMessage) = Engine.countTokens(c.content) + 8
+        var left = maxOf(300, ctx - replyRoom - Engine.countTokens(sys) - 48)
+
+        // Keeps the start and the end of [text] (a page's clickable elements are listed last) within [tokens].
+        fun cutToTokens(text: String, tokens: Int): String {
+            if (tokens <= 0) return ""
+            var chars = text.length
+            for (attempt in 0 until 4) {
+                val n = Engine.countTokens(text.take(chars))
+                if (n <= tokens) break
+                chars = (chars * tokens.toDouble() / n * 0.92).toInt()
+            }
+            if (chars >= text.length) return text
+            val head = (chars * 0.6).toInt()
+            return text.take(head) + "\n…[cut to fit the model's memory]…\n" + text.takeLast(maxOf(0, chars - head - 40))
+        }
+
+        fun clip(text: String, max: Int, note: String): String =
+            if (text.length <= max) text else text.take((max * 0.7).toInt()) + "\n…[$note]…\n" + text.takeLast((max * 0.3).toInt())
+
+        fun toChat(m: UiMessage, current: Boolean, detail: Int): ChatMessage? = when (m.role) {
+            Role.USER -> {
+                val t = m.modelText ?: m.text
+                ChatMessage("user", if (current) t else clip(t, if (detail == 0) 2400 else 500, "earlier message shortened"))
+            }
+            Role.ASSISTANT -> if (m.text.isBlank()) null
+                else ChatMessage("assistant", if (current) m.text else clip(m.text, if (detail == 0) 3000 else 700, "earlier reply shortened"))
+            Role.TOOL, Role.RUN -> {
+                val body = if (m.role == Role.TOOL) m.text else (m.modelText ?: m.text)
+                val max = if (current) (if (detail == 0) Int.MAX_VALUE else 1200) else (if (detail == 0) 1200 else 300)
+                ChatMessage("user", (if (m.role == Role.TOOL) "[Tool results]\n" else "[Code output]\n") + clip(body, max, "older result cut"))
+            }
+            Role.NOTE -> null
+        }
+
+        val all = messages.toList()
+        val lastUser = all.indexOfLast { it.role == Role.USER }.coerceAtLeast(0)
+        val picked = sortedMapOf<Int, ChatMessage>()
+
+        // 1) The user's current question: always kept. When it refers back ("what did I just ask?"), a note naming
+        // the previous message goes after it: given the whole chat, models still mix up the order and quote the first
+        // message, or whichever one held facts.
+        val note = all.getOrNull(lastUser)?.takeIf { it.role == Role.USER && refersBack.containsMatchIn(it.text) }
+            ?.let { previousMessageNote(all, lastUser) } ?: ""
+        all.getOrNull(lastUser)?.let { m -> toChat(m, true, 0)?.let { c0 ->
+            val c = if (note.isEmpty()) c0 else ChatMessage(c0.role, c0.content + note)
+            val fit = if (cost(c) <= left) c else ChatMessage(c.role, cutToTokens(c.content, maxOf(200, left / 2)))
+            left -= cost(fit); picked[lastUser] = fit
+        } }
+        // 2) The work done for it so far, newest first (the newest result in full, earlier ones shortened).
+        var newest = true
+        for (i in all.indices.reversed()) {
+            if (i <= lastUser) break
+            val c = toChat(all[i], true, if (newest && all[i].role != Role.ASSISTANT) 0 else 1) ?: continue
+            if (all[i].role != Role.ASSISTANT) newest = false
+            val fit = when {
+                cost(c) <= left -> c
+                left > 250 -> ChatMessage(c.role, cutToTokens(c.content, left - 20))
+                else -> null
+            } ?: break
+            left -= cost(fit); picked[i] = fit
+        }
+        // 3) Earlier conversation, newest first: full detail while there's room, then shortened.
+        var droppedFrom = -1
+        for (i in (lastUser - 1) downTo 0) {
+            val full = toChat(all[i], false, 0) ?: continue
+            val c = if (cost(full) <= left) full else toChat(all[i], false, 1)!!
+            if (cost(c) > left) { droppedFrom = i; break }
+            left -= cost(c); picked[i] = c
+        }
+        // 4) Whatever didn't fit: a short reminder of what the user asked, so the thread isn't lost.
+        var recap = ""
+        if (droppedFrom >= 0) {
+            val asked = all.subList(0, droppedFrom + 1).filter { it.role == Role.USER }.map { it.text.replace(Regex("\\s+"), " ").take(160) }
+            val lines = mutableListOf<String>()
+            for (q in asked.asReversed()) {
+                val line = "- $q"
+                if (Engine.countTokens(line) + 12 > left) break
+                left -= Engine.countTokens(line) + 1
+                lines.add(0, line)
+            }
+            if (lines.isNotEmpty()) recap = "[Earlier in this conversation (older messages no longer shown in full) I asked:\n" +
+                lines.joinToString("\n") + "]\n\n"
+        }
+
+        // Many chat templates need alternating turns: merge neighbours with the same role.
+        val merged = mutableListOf<ChatMessage>()
+        for (m in picked.values) {
+            val last = merged.lastOrNull()
+            if (last != null && last.role == m.role) merged[merged.size - 1] = ChatMessage(m.role, last.content + "\n\n" + m.content)
+            else merged += m
+        }
+        while (merged.isNotEmpty() && merged.first().role != "user") merged.removeAt(0)
+        if (merged.isEmpty()) merged += ChatMessage("user", cutToTokens(lastUserText(), maxOf(200, left)).ifBlank { "Hello" })
+        if (recap.isNotEmpty()) merged[0] = ChatMessage("user", recap + merged[0].content)
+        if (merged.last().role == "user" && picked.values.lastOrNull()?.content?.let { it.startsWith("[Tool results]") || it.startsWith("[Code output]") } == true) {
+            // After tool output small models forget what was asked: repeat the question.
+            val q = all.getOrNull(lastUser)?.takeIf { it.role == Role.USER }?.text?.take(500)
+            if (!q.isNullOrBlank()) merged[merged.size - 1] = ChatMessage("user", merged.last().content +
+                "\n\n[The user's question: $q]\nIf the results above answer it, answer it now, fully and directly.")
+        }
+        return listOf(ChatMessage("system", sys)) + merged
+    }
+
+    /** The user is asking about an earlier message: "what was my last prompt", "what did I just ask"… */
+    private val refersBack = Regex(
+        "\\b(previous|last|earlier|before|prior|first)\\b.{0,30}\\b(prompt|question|message|request|ask|asked|said|typed|wrote)|" +
+            "what (did|was) i (just )?(ask|say|said|tell|type|write|want)|" +
+            "\\b(remind me what|you said|i said|i asked|i told you|i just asked)\\b", RegexOption.IGNORE_CASE)
+
+    /** Names the user's message before [lastUser], and lists the ones before it ("" if there are none). */
+    private fun previousMessageNote(all: List<UiMessage>, lastUser: Int): String {
+        val users = all.take(lastUser).filter { it.role == Role.USER }
+        if (users.isEmpty()) return ""
+        fun short(m: UiMessage) = m.text.replace(Regex("\\s+"), " ").trim().let { if (it.length > 200) it.take(200) + "…" else it }
+        val sb = StringBuilder("\n\n[Note from the app: my previous message, the one just before this one, was: \"${short(users.last())}\"")
+        val earlier = users.dropLast(1).takeLast(7)
+        if (earlier.isNotEmpty()) {
+            val first = users.size - earlier.size
+            sb.append(". My earlier messages, oldest first: ")
+            sb.append(earlier.mapIndexed { i, m -> "${first + i}. \"${short(m)}\"" }.joinToString(" "))
+        }
+        return sb.append("]").toString()
+    }
+
+    private fun lastUserText(): String =
+        messages.lastOrNull { it.role == Role.USER }?.let { it.modelText ?: it.text } ?: ""
+
+    /** Runs code and adds its output to the chat. Returns true if it ran. */
+    private suspend fun executeRun(run: FileAction.Run, p: PendingAction?): Boolean {
+        val out = UiMessage(Role.RUN, "Running ${run.path}…")
+        messages += out
+        runningCode = true
+        val r = try {
+            CodeRunner.run(getApplication<Application>(), run.path, run.code, runDir())
+        } finally {
+            runningCode = false
+        }
+        out.text = (if (r.ok) "✓ " else if (r.timedOut) "⏱ " else "✗ ") + "${r.lang}\n${r.output}"
+        out.modelTextOverride = r.forModel()
+        r.previewFile?.let { f ->
+            // HTML opens in LocalForge's browser, so the AI sees the page, its buttons and any errors, and can test it.
+            showBrowser()
+            val report = browserStep(FileAction.Browser("browse", f.absolutePath)) { WebBrowser.openPage(f) }
+            val ok = !report.contains("[error]") && !report.contains("Uncaught")
+            out.text = (if (ok) "✓ " else "✗ ") + "html (browser)\nSaved ${f.absolutePath} and opened it in the Browser tab."
+            out.modelTextOverride = "Your HTML page was saved to ${f.absolutePath} and opened in your browser. " +
+                "Test it with <click>/<type>/<js> and fix any errors.\n\n" + report
+            ranCode = true
+        }
+        if (!r.ok) failedCode += codeKey(run.path, run.code)
+        ranCode = true
+        p?.result = if (r.ok) "Ran successfully" else if (r.timedOut) "Stopped: took too long" else "Failed — see output"
+        refreshFiles()
+        return true
+    }
+
+    // ---- Per-request agent state (mirrors the desktop app) ----
+    private var totalSteps = 0
+    private var repeats = 0
+    private var lastReply: String? = null
+    private var ranCode = false
+    private var moved = false
+    private var moveNudged = false
+    private val seenUrls = mutableSetOf<String>()
+    private val doneLookups = mutableSetOf<String>()
+    private val blockedSites = mutableSetOf<String>()
+    private val failedCode = mutableSetOf<String>()
+
+    private fun resetRequestState() {
+        repeats = 0; lastReply = null; ranCode = false; moved = false; moveNudged = false
+        repliesThisRequest = 0; deadlineHit = false
+        seenUrls.clear(); doneLookups.clear(); blockedSites.clear(); failedCode.clear()
+        recentReplies.clear()
+    }
+
+    private val webWords = Regex(
+        "\\b(web|website|site|online|internet|google|search the|browse|browser|news|latest|price|prices|deal|deals|weather|" +
+            "amazon|ebay|youtube|reddit|wikipedia|hacker news|www)\\b|https?://|\\b[\\w-]+\\.(com|co\\.uk|org|net|io)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val dataWords = Regex(
+        "\\b(extract|scrape|table|list|top \\d+|prices?|cheapest|compare|rank(ed|ing)?|csv|deals?|stories|results|data|" +
+            "population|market cap|sorted?|how many)\\b", RegexOption.IGNORE_CASE
+    )
+    private val navAsk = Regex("\\b(open|click|go to|go into|navigate|visit|switch to|press)\\b", RegexOption.IGNORE_CASE)
+    private val tagAny = Regex("<(write|run|type|js)\\b[\\s\\S]*?(</\\1>|$)|<[a-z]+\\b[^>]*/?>", RegexOption.IGNORE_CASE)
+    private val claims = Regex(
+        "ran successfully|run successfully|executed successfully|(saved|written|created) (it |the file |the csv |successfully)|tests? (all )?pass",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** A short, normalised fingerprint of a reply, so near-identical replies (and A/B/A/B loops) match. */
+    private fun fingerprint(text: String): String =
+        FileTools.stripThinking(text).lowercase().replace(Regex("[^a-z0-9<>/= ]"), "").replace(Regex("\\s+"), " ").trim().take(160)
+
+    /** The reply with tool tags removed: what the user actually reads. */
+    private fun proseOf(reply: String): String = FileTools.stripThinking(reply).replace(tagAny, "").trim()
+
+    private fun codeKey(lang: String, code: String): String =
+        lang + "|" + code.replace(Regex("/\\*[\\s\\S]*?\\*/"), "").replace(Regex("(?m)(--|#|//)[^\\n'\"]*$"), "").replace(Regex("\\s+"), " ").trim()
+
+    /** Shows the Browser tab with the chat panel open, so the user can watch the AI work on the page. */
+    private fun showBrowser() {
+        main.post {
+            // The Autopilot works in the background: don't pull the user away from the screen they're on.
+            if (tab != Tab.BROWSER && tab != Tab.AUTOPILOT) { tab = Tab.BROWSER; pagePanelOpen = true }
+        }
+    }
+
+    /** Runs one browser step with its label shown live over the page. */
+    private suspend fun browserStep(a: FileAction.Browser, run: suspend () -> String = { BrowserTools.execute(a) }): String {
+        if (a.kind in setOf("browse", "click", "type", "press")) moved = true
+        WebBrowser.step = BrowserTools.chip(a.kind, a.path, a.extra)
+        return try { run() } finally { WebBrowser.step = null }
+    }
+
+    private fun siteFor(a: FileAction.Browser): String {
+        val u = when (a.kind) {
+            "browse", "fetch" -> a.path
+            "page", "click", "type", "press", "js", "scroll" -> WebBrowser.url
+            else -> ""
+        }
+        return if (Regex("^(https?://)?[\\w-]+(\\.[\\w-]+)+(/|$|:)", RegexOption.IGNORE_CASE).containsMatchIn(u.trim())) BrowserTools.siteOf(u) else ""
+    }
+
+    /** Small models often cut a link short (…/japan/toky). If it's the start of exactly one link we've seen, use that. */
+    private fun fixUrl(a: FileAction.Browser): FileAction.Browser {
+        val u = a.path.trim()
+        if (u.isEmpty() || u in seenUrls) return a
+        val path = u.replace(Regex("^https?://[^/]+"), "")
+        if (u.endsWith("/") || !Regex("[A-Za-z0-9]$").containsMatchIn(u) || path.count { it == '/' } < 1 || path.length < 3) return a
+        val matches = seenUrls.filter { it.startsWith(u) && it.length - u.length <= 12 && Regex("[A-Za-z0-9_-]+/?").matches(it.substring(u.length)) }
+        return if (matches.size == 1) a.copy(path = matches[0]) else a
+    }
+
+    /** After clicks or typing the page is different, so reading or reopening it is allowed again. */
+    private fun pageChanged() {
+        doneLookups.removeAll { k -> listOf("browse|", "page|", "fetch|", "extract|").any { k.startsWith(it) } }
+    }
+
+    private fun noteResult(a: FileAction.Browser, r: String) {
+        if (a.kind == "js" && (r.startsWith("Browser error") || r.take(80).contains("returned nothing") ||
+                Regex("^Script result:\\s*(\\[\\s*]|null|\\{\\s*\\})\\s*$").containsMatchIn(r))) failedCode += codeKey("js", a.content)
+        if (r.contains("This site blocked the browser")) siteFor(a).takeIf { it.isNotEmpty() }?.let { blockedSites += it }
+    }
+
+    private suspend fun autoExtract(): String {
+        val ex = try { WebBrowser.extract(lastUserText().take(120)) } catch (_: Exception) { return "" }
+        if (ex.startsWith("No tables")) return ""
+        doneLookups += "extract|||" + WebBrowser.url
+        return "Data extracted from this page automatically (tables/lists as rows; ▲/▼ = up/down shown by colour). " +
+            "Use these rows; sort, filter or total them with <run lang=\"python\">:\n" + ex
+    }
+
+    /** A <js> scraper that came back empty or broken: hand over the page's data the easy way. */
+    private suspend fun extractIfEmpty(a: FileAction.Browser, r: String): String {
+        if (a.kind != "js") return ""
+        val empty = r.startsWith("Browser error") || r.take(80).contains("returned nothing") ||
+            Regex("^Script result:\\s*(\\[\\s*]|null|\\{\\s*\\})").containsMatchIn(r) || Regex("null").findAll(r).count() > 5
+        if (!empty) return ""
+        val ex = autoExtract()
+        return if (ex.isNotEmpty()) "\n\nYour script didn't get the data. Here it is extracted for you:\n$ex" else ""
+    }
+
+    /** One line for an action card: the error, or the page the browser ended up on. */
+    private fun short(result: String): String {
+        val first = result.substringBefore('\n')
+        if (first.startsWith("Browser error") || first.startsWith("Script result")) return result.take(200)
+        val page = Regex("Browser page: (.*)").find(result)?.groupValues?.get(1)
+        return if (page != null) "${first.trimEnd(':').replace(" Now", "")} - now on: ${page.take(120)}" else first.take(200)
+    }
+
+    /** The user asked to open/click something but the model answered without moving: send it back once. */
+    private fun skippedNavigation(): Boolean {
+        if (moved || moveNudged) return false
+        var asked = ""
+        var usedBrowser = false
+        for (m in messages.asReversed()) {
+            if (m.role == Role.USER) {
+                asked = m.text
+                usedBrowser = usedBrowser || (m.modelText ?: "").contains("looking at this page in your browser")
+                break
+            }
+            if (m.role == Role.TOOL && Regex("^(Browser page|Data on the page|Web search results|Scrolled)").containsMatchIn(m.text)) usedBrowser = true
+        }
+        if (!usedBrowser || !navAsk.containsMatchIn(asked.take(400))) return false
+        moveNudged = true
+        messages += UiMessage(Role.TOOL, "The user asked you to open or click something, but you haven't opened, clicked or " +
+            "navigated anything yet, so your answer is about the wrong page. Do that step first (<click n=\"...\"/> on the right " +
+            "element, or <browse url=\"...\"/>), then answer from the new page.")
+        return true
+    }
+
+    /** Warns when the answer has links, prices or percentages that appear in no page or output, or claims unproven success. */
+    private fun checkClaims(reply: UiMessage) {
+        val prose = proseOf(reply.text)
+        val urlRe = Regex("https?://[^\\s)\\]\"'<>|*]+")
+        val seen = messages.filter { it.role == Role.TOOL || it.role == Role.RUN || it.role == Role.USER }
+            .joinToString(" ") { it.text + " " + (it.modelText ?: "") }.replace("&amp;", "&")
+        val core = { u: String ->
+            u.replace("&amp;", "&").replace(Regex("^https?://(www\\.)?"), "").substringBefore('?').substringBefore('#')
+                .trimEnd('/', '.', ',', ';', ':').lowercase()
+        }
+        val links = urlRe.findAll(prose).map { it.value }.toSet()
+        if (links.isNotEmpty()) {
+            val seenCores = urlRe.findAll(seen).map { core(it.value) }.toSet()
+            val madeUp = links.filter { core(it) !in seenCores }
+            if (madeUp.isNotEmpty()) messages += UiMessage(Role.NOTE,
+                "⚠ These links didn't appear in any page LocalForge opened, so they may be made up: " + madeUp.sorted().take(5).joinToString(", "))
+        }
+        val numRe = Regex("\\d(?:[\\d,]*\\d)?(?:\\.\\d+)?")
+        val nums = { t: String -> numRe.findAll(t).mapNotNull { it.value.replace(",", "").toDoubleOrNull() }.toSet() }
+        val seenNums = nums(seen)
+        val odd = Regex("[£$€]\\s?\\d(?:[\\d,]*\\d)?(?:\\.\\d+)?|\\b\\d(?:[\\d,]*\\d)?(?:\\.\\d+)?\\s?%").findAll(prose)
+            .map { it.value }.filter { !seenNums.containsAll(nums(it)) }.distinct().take(6).toList()
+        if (odd.isNotEmpty()) messages += UiMessage(Role.NOTE,
+            "⚠ These numbers didn't appear in any page or code output, so they may be estimates or made up: " + odd.joinToString(", "))
+        if (!claims.containsMatchIn(prose)) return
+        val since = mutableListOf<UiMessage>()
+        for (m in messages.asReversed()) {
+            if (m.role == Role.USER) break
+            if (m.role == Role.RUN || m.role == Role.TOOL) since += m
+        }
+        val okRun = since.any { it.role == Role.RUN && it.text.startsWith("✓") }
+        val okTool = since.any {
+            it.role == Role.TOOL && Regex("^(Saved|Created|Typed and submitted|Did \\d+ of|Browser page|Clicked|Data |Fetched|Script result|Pressed)").containsMatchIn(it.text)
+        }
+        val runs = since.filter { it.role == Role.RUN }
+        val failedLast = runs.isNotEmpty() && !runs.first().text.startsWith("✓") && !okTool
+        if ((!okRun && !okTool) || failedLast) messages += UiMessage(Role.NOTE,
+            "⚠ LocalForge couldn't confirm this: no successful run or saved file in this request matches what the answer says. Check the result before relying on it.")
+    }
+
+    private fun runAgent() {
+        if (generating) return
+        genJob = viewModelScope.launch {
+            generating = true
+            stopRequested = false
+            val requestDeadline = (if (requestStartedAt > 0) requestStartedAt else System.currentTimeMillis()) + requestLimitMs
+            val requestWatchdog = launch {
+                delay((requestDeadline - System.currentTimeMillis()).coerceAtLeast(1000))
+                deadlineHit = true
+                Engine.stop()
+            }
+            try {
+                while (stepsLeft > 0) {
+                    stepsLeft--
+                    // Loop stopper 1: a hard cap on model replies, plus the whole-request deadline.
+                    val overCap = repliesThisRequest >= maxRepliesPerRequest || deadlineHit ||
+                        (requestStartedAt > 0 && System.currentTimeMillis() - requestStartedAt > requestLimitMs)
+                    if (overCap && timeNudged) {
+                        messages += UiMessage(Role.NOTE, "Stopped: this was taking too long and going in circles. " +
+                            "The model is likely too small or too slow for this task on this phone. Try a simpler request or a bigger model.")
+                        break
+                    }
+                    if (overCap && totalSteps > 0) {
+                        timeNudged = true
+                        messages += UiMessage(Role.TOOL, "Stop now. Don't use any more tools or steps. Give the user your best answer " +
+                            "from what you already have, in a few sentences, and say what you couldn't finish.")
+                        stepsLeft = 1
+                    }
+                    stepNumber = totalSteps + 1
+                    val reply = UiMessage(Role.ASSISTANT, "")
+                    messages += reply
+                    var cutShort = false
+                    var thinkCut = false
+                    val replyStart = System.currentTimeMillis()
+                    val watchdog = launch {
+                        delay(replyLimitMs)
+                        cutShort = true
+                        Engine.stop()
+                    }
+                    val sb = StringBuilder()
+                    var pieces = 0
+                    var prevLine = ""
+                    var sameLineRun = 0
+                    var streamLoop = false
+                    var full = try {
+                        val hist = history()
+                        val first = Engine.chat(hist, maxTokens, temperature, noThink = !thinkHarder) { piece ->
+                            sb.append(piece)
+                            pieces++
+                            main.post { reply.text += piece }
+                            // Loop stopper 3 (the common one on tiny models): the same short line streamed over and
+                            // over inside ONE reply, e.g. "<page/>" on every line. Cut it off as soon as it's clear.
+                            if (!streamLoop && piece.contains("\n")) {
+                                val lines = sb.split("\n")
+                                if (lines.size >= 2) {
+                                    val done = lines[lines.size - 2].trim()
+                                    if (done.isNotEmpty() && done.length <= 80 && done == prevLine) {
+                                        if (++sameLineRun >= 4) { streamLoop = true; Engine.stop() }
+                                    } else { prevLine = done; sameLineRun = 0 }
+                                }
+                            }
+                            // Thinking that goes round in circles: cut it off and make the model act on what it has.
+                            if (thinkHarder && !thinkCut && sb.contains("<think>") && !sb.contains("</think>") &&
+                                (pieces > thinkTokenBudget || System.currentTimeMillis() - replyStart > thinkTimeBudgetMs)) {
+                                thinkCut = true
+                                Engine.stop()
+                            }
+                        }
+                        if (thinkCut && !cutShort && !deadlineHit && !stopRequested) {
+                            val prefill = first.trimEnd() + "\n\nI've thought enough. Now I act: the next step, as a tool tag, or my answer.\n</think>\n\n"
+                            main.post { reply.text = prefill }
+                            val sb2 = StringBuilder(prefill)
+                            prefill + Engine.chat(hist, maxTokens, temperature, prefill = prefill) { piece ->
+                                sb2.append(piece)
+                                main.post { reply.text += piece }
+                                if (sb2.contains("<think>") && !sb2.contains("</think>")) Engine.stop()  // no second think block
+                            }
+                        } else first
+                    } finally {
+                        watchdog.cancel()
+                    }
+                    if (deadlineHit) {
+                        reply.text = FileTools.stripThinking(full).ifEmpty { "(stopped — taking too long)" }
+                        messages += UiMessage(Role.NOTE, "Stopped: this request hit its time limit. Here's the reply so far. " +
+                            "For hard tasks a bigger or faster model (Models tab) does far better than a small one on a phone.")
+                        break
+                    }
+                    if (cutShort) {
+                        reply.text = FileTools.stripThinking(full).ifEmpty { "(no answer yet)" }
+                        messages += UiMessage(Role.NOTE, "Stopped this reply after ${replyLimitMs / 60_000} minutes so it doesn't run forever. " +
+                            "The model is too slow or too small for this task on this phone. Try a simpler question, " +
+                            "a faster/bigger model, or say \"continue\".")
+                        break
+                    }
+                    // A reply that got stuck repeating one line: collapse the repeats and nudge it to move on.
+                    if (streamLoop) {
+                        full = full.lineSequence().fold(StringBuilder() to "") { (acc, last), line ->
+                            if (line.trim() == last && line.trim().isNotEmpty()) acc to last
+                            else { if (acc.isNotEmpty()) acc.append("\n"); acc.append(line) to line.trim() }
+                        }.first.toString()
+                        reply.text = FileTools.stripThinking(full)
+                        repeats++
+                        if (repeats >= 2) {
+                            messages += UiMessage(Role.NOTE, "Stopped: the model got stuck repeating the same step. " +
+                                "This is a sign it's too small for this task — a bigger or faster model (Models tab) will do much better.")
+                            break
+                        }
+                        messages += UiMessage(Role.TOOL, "You repeated the same line many times instead of answering. " +
+                            "Do NOT do that. Take ONE concrete next step, or just answer the user in plain sentences.")
+                        continue
+                    }
+                    reply.text = FileTools.stripThinking(full)
+                    if (reply.text.isEmpty()) reply.text = if (stopRequested) "(stopped)" else "(no reply)"
+                    reply.stats = "%.1f tokens/sec".format(Engine.lastTokensPerSecond)
+                    if (looksBroken(reply.text)) {
+                        messages += UiMessage(
+                            Role.NOTE,
+                            "This reply looks like gibberish. That usually means the model file is too heavily compressed " +
+                                "(Q2/Q3) or broken. Download a Q4_K_M or Q4_0 version from the Models tab."
+                        )
+                        break
+                    }
+                    if (stopRequested) {
+                        messages += UiMessage(Role.NOTE, "Stopped.")
+                        break
+                    }
+                    totalSteps++
+                    repliesThisRequest++
+                    // Loop stopper 2: this reply repeats (or closely matches) a recent one, incl. A/B/A/B cycles.
+                    val fp = fingerprint(reply.text)
+                    if (fp.length > 8 && recentReplies.contains(fp)) {
+                        repeats++
+                        if (repeats >= 2) {
+                            messages += UiMessage(Role.NOTE, "Stopped: the model kept repeating itself. Here's its last reply. " +
+                                "A bigger or faster model (Models tab) will get through this; a small one on a phone often gets stuck.")
+                            break
+                        }
+                        messages += UiMessage(Role.TOOL, "You are repeating an earlier reply and going in circles. Do NOT repeat it. " +
+                            "Either take a different next step, or give the user your final answer now with what you have.")
+                        continue
+                    }
+                    recentReplies.addLast(fp)
+                    while (recentReplies.size > 5) recentReplies.removeFirst()
+
+                    var actions = FileTools.parse(full)
+                    if (actions.none { it is FileAction.Run } && !ranCode && repeats == 0) {
+                        // Only before any code ran: later, code blocks in a final answer are examples, not requests.
+                        FileTools.fallbackRun(lastUserText(), full)?.let { actions = actions + it }
+                    }
+                    // Small models often finish a full answer and then ask for a needless click. Drop it.
+                    var dropped = false
+                    if (proseOf(full).length > 350 && actions.isNotEmpty() &&
+                        actions.all { it is FileAction.Browser && it.kind in setOf("click", "type", "press", "scroll", "page") }) {
+                        actions = emptyList(); dropped = true
+                    }
+                    if (actions.isEmpty() && !dropped && repeats == 0 && BrowserTools.anyTag.containsMatchIn(FileTools.stripThinking(full))) {
+                        repeats++
+                        messages += UiMessage(Role.TOOL, "A tool tag in your reply wasn't understood, so nothing was done. " +
+                            "Write it exactly like the examples, e.g. <search query=\"words\"/>.")
+                        continue
+                    }
+                    if (actions.isEmpty() && skippedNavigation()) continue
+                    if (actions.isEmpty()) {
+                        checkClaims(reply)
+                        break
+                    }
+
+                    val browserAuto = autoApprove || browserAutoApprove
+                    val results = mutableListOf<String>()
+                    var continueLoop = false
+                    var navigated = false   // a page opened in this reply: element numbers after it were guessed blind
+                    var waitingCard: PendingAction? = null
+                    for ((i, a0) in actions.withIndex()) {
+                        // A card waits for the user: everything after it depends on it, so it runs after approval.
+                        val wc = waitingCard
+                        if (wc != null && !(a0 is FileAction.Browser && !a0.browserRead && (wc.action is FileAction.Batch || wc.action is FileAction.Browser))) {
+                            wc.queued = actions.drop(i)
+                            break
+                        }
+                        var a = a0
+                        if (a is FileAction.Browser) {
+                            if (a.kind == "browse" || a.kind == "fetch") a = fixUrl(a)
+                            val key = "${a.kind}|${a.path}|${a.content}" + if (a.kind in setOf("extract", "page", "scroll", "network")) "|" + WebBrowser.url else ""
+                            val site = siteFor(a)
+                            when {
+                                a.kind in BrowserTools.PAGE_KINDS && !WebBrowser.hasPage -> {
+                                    repeats++
+                                    results += "No web page is open, so this wasn't done (${a.label}). Use <search query=\"...\"/> or " +
+                                        "<browse url=\"...\"/> first, or if the user is just chatting, simply answer them."
+                                    continueLoop = true
+                                }
+                                site.isNotEmpty() && site in blockedSites -> {
+                                    repeats++
+                                    results += "Skipped (${a.label}): $site blocks the browser. Don't use that site again. Use another result or answer with what you have."
+                                }
+                                a.browserRead && key in doneLookups -> {
+                                    repeats++
+                                    results += "You already did this (${a.label}) and got the result above. Do not repeat it. Use what you have and answer the user now."
+                                }
+                                a.kind == "js" && codeKey("js", a.content) in failedCode -> {
+                                    repeats++
+                                    results += "That exact script already failed or the user said no to it. Don't run it again. Fix it differently, or answer with what you have."
+                                }
+                                navigated && a.kind in setOf("click", "type", "press", "js") ->
+                                    results += "Skipped (${a.label}): you planned it before seeing the new page. Look at the page above and pick element numbers from it."
+                                a.browserRead -> {
+                                    if (a.kind == "browse" || a.kind == "search") navigated = true
+                                    showBrowser()
+                                    var r = browserStep(a)
+                                    noteResult(a, r)
+                                    if (a.kind == "browse" && dataWords.containsMatchIn(lastUserText()) && !r.contains("[LocalForge note]")) {
+                                        r += "\n\n" + autoExtract()
+                                    }
+                                    if (a.kind == "search" || a.kind == "browse") {
+                                        seenUrls += Regex("https?://[^\\s)\\]\"'<>]+").findAll(r).map { it.value }
+                                    }
+                                    results += r
+                                    if (a.kind != "scroll") doneLookups += key
+                                    continueLoop = true
+                                }
+                                a.kind == "js" || a.kind == "mod" -> {
+                                    // Code for the page runs straight on the live page, like code the AI runs on the phone.
+                                    val p = PendingAction(a)
+                                    p.status = ActionStatus.DONE
+                                    reply.actions += p
+                                    showBrowser()
+                                    var r = browserStep(a)
+                                    r += extractIfEmpty(a, r)
+                                    pageChanged()
+                                    noteResult(a, r)
+                                    p.result = short(r)
+                                    results += r
+                                    continueLoop = true
+                                }
+                                browserAuto -> {
+                                    val p = PendingAction(a)
+                                    p.status = ActionStatus.DONE
+                                    reply.actions += p
+                                    showBrowser()
+                                    var r = browserStep(a)
+                                    r += extractIfEmpty(a, r)
+                                    pageChanged()
+                                    noteResult(a, r)
+                                    p.result = short(r)
+                                    results += r
+                                    continueLoop = true
+                                }
+                                else -> {
+                                    val last = reply.actions.lastOrNull()
+                                    if (last != null && last === waitingCard && last.status == ActionStatus.PENDING &&
+                                        (last.action is FileAction.Browser || last.action is FileAction.Batch)) {
+                                        // Several clicks/typing in one reply: one card for all of them, run in order.
+                                        val steps = when (val la = last.action) {
+                                            is FileAction.Batch -> la.steps + a
+                                            is FileAction.Browser -> listOf(la, a)
+                                            else -> listOf(a)
+                                        }
+                                        val merged = PendingAction(FileAction.Batch(steps))
+                                        reply.actions[reply.actions.size - 1] = merged
+                                        waitingCard = merged
+                                    } else {
+                                        val p = PendingAction(a)
+                                        reply.actions += p
+                                        waitingCard = p
+                                    }
+                                }
+                            }
+                            continue
+                        }
+                        if (a.readOnly) {
+                            results += if (!hasFileAccess) "No file access yet: the user must allow all-files access on the Home tab."
+                            else withContext(Dispatchers.IO) { FileTools.execute(a) }
+                            continueLoop = true
+                            continue
+                        }
+                        if (a is FileAction.Run && codeKey(a.path, a.code) in failedCode) {
+                            repeats++
+                            results += "That exact code already failed or the user said no to it. Don't run it again. Fix it differently, or answer with what you have."
+                            continueLoop = true
+                            continue
+                        }
+                        val p = PendingAction(a)
+                        reply.actions += p
+                        if (a is FileAction.Run && autoApprove) {
+                            p.status = ActionStatus.DONE
+                            executeRun(a, p)
+                            continueLoop = true
+                        } else if (a !is FileAction.Run && autoApprove && a !is FileAction.Delete && hasFileAccess) {
+                            p.status = ActionStatus.DONE
+                            val r = withContext(Dispatchers.IO) { FileTools.execute(a) }
+                            p.result = r
+                            results += r
+                            refreshFiles()
+                            continueLoop = true
+                        } else {
+                            waitingCard = p
+                        }
+                    }
+                    if (repeats >= 2 && stepsLeft > 1 && waitingCard == null) {
+                        results += "STOP using tools now. Write your final answer to the user from the results above. " +
+                            "If you couldn't get the information, say so and share what you did find."
+                        stepsLeft = 1
+                    }
+                    if (results.isNotEmpty()) messages += UiMessage(Role.TOOL, results.joinToString("\n\n"))
+                    if (waitingCard != null || !continueLoop) break
+                    if (stepsLeft == 0) messages += UiMessage(Role.NOTE, "Paused after several steps. Say \"continue\" to keep going.")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                messages += UiMessage(Role.NOTE, e.message ?: "Something went wrong")
+            } finally {
+                requestWatchdog.cancel()
+                WebBrowser.step = null
+                generating = false
+                saveChat()
+                val app = getApplication<LocalForgeApp>()
+                if (!app.visible) WorkService.notifyDone(app, "Your reply is ready — tap to view")
+            }
+        }
+    }
+
+    private fun messageOf(p: PendingAction): UiMessage? = messages.lastOrNull { m -> m.actions.any { it === p } }
+
+    /** After a card is answered: run the steps queued behind it, then let the model carry on. */
+    private suspend fun afterCard(p: PendingAction) {
+        val outs = mutableListOf<String>()
+        for (q in p.queued) {
+            if (q is FileAction.Browser && q.browserRead) outs += browserStep(q)
+            else if (q.readOnly && hasFileAccess) outs += withContext(Dispatchers.IO) { FileTools.execute(q) }
+            else { outs += "Not done yet: ${q.label}. Ask for it again if you still need it."; break }
+        }
+        p.queued = emptyList()
+        if (outs.isNotEmpty()) messages += UiMessage(Role.TOOL, outs.joinToString("\n\n"))
+        val stillWaiting = messageOf(p)?.actions?.any { it.status == ActionStatus.PENDING } == true
+        if (Engine.isLoaded && !stillWaiting) {
+            if (stepsLeft <= 0 && totalSteps < 24) stepsLeft = 3
+            runAgent()
+        }
+    }
+
+    fun approve(p: PendingAction) {
+        if (p.status != ActionStatus.PENDING) return
+        val a = p.action
+        if (generating) {
+            p.result = "Wait for the current reply to finish."
+            return
+        }
+        if (a is FileAction.Run) {
+            p.status = ActionStatus.DONE
+            viewModelScope.launch {
+                executeRun(a, p)
+                afterCard(p)
+            }
+            return
+        }
+        if (a is FileAction.Browser || a is FileAction.Batch) {
+            p.status = ActionStatus.DONE
+            viewModelScope.launch {
+                generating = true
+                try {
+                    showBrowser()
+                    if (a is FileAction.Batch) {
+                        val outs = mutableListOf<String>()
+                        for (st in a.steps) {
+                            var r = browserStep(st)
+                            r += extractIfEmpty(st, r)
+                            noteResult(st, r)
+                            if (r.startsWith("Browser error")) { outs += "${st.label}: $r"; break }
+                            outs += "${st.label}: done"
+                        }
+                        p.result = "Did ${outs.size} of ${a.steps.size} steps"
+                        val page = try { WebBrowser.describe(1800) } catch (e: Exception) { "(couldn't read the page: ${e.message})" }
+                        messages += UiMessage(Role.TOOL, outs.joinToString("\n") + "\n\nThe page now (check it shows what you expected):\n" + page)
+                    } else if (a is FileAction.Browser) {
+                        var r = browserStep(a)
+                        r += extractIfEmpty(a, r)
+                        noteResult(a, r)
+                        p.result = short(r)
+                        messages += UiMessage(Role.TOOL, r)
+                    }
+                    pageChanged()
+                } catch (e: Exception) {
+                    messages += UiMessage(Role.NOTE, e.message ?: "Browser step failed")
+                } finally {
+                    generating = false
+                }
+                afterCard(p)
+            }
+            return
+        }
+        if (!hasFileAccess) {
+            p.result = "Grant all-files access on the Files tab first."
+            return
+        }
+        p.status = ActionStatus.DONE
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { FileTools.execute(a) }
+            p.result = r
+            messages += UiMessage(Role.TOOL, r)
+            refreshFiles()
+            pageChanged()
+            afterCard(p)
+        }
+    }
+
+    /** ▶ Run button on a code block: runs it and shows the output (the model sees it next turn). */
+    fun runSnippet(lang: String, code: String) {
+        viewModelScope.launch {
+            executeRun(FileAction.Run(FileTools.normalizeLang(lang), code), null)
+        }
+    }
+
+    fun reject(p: PendingAction) {
+        if (p.status != ActionStatus.PENDING) return
+        p.status = ActionStatus.REJECTED
+        when (val a = p.action) {
+            is FileAction.Run -> failedCode += codeKey(a.path, a.code)
+            is FileAction.Browser -> if (a.kind == "js") failedCode += codeKey("js", a.content)
+            is FileAction.Batch -> a.steps.filter { it.kind == "js" }.forEach { failedCode += codeKey("js", it.content) }
+            else -> {}
+        }
+        p.queued = emptyList()
+        val stillWaiting = messageOf(p)?.actions?.any { it.status == ActionStatus.PENDING } == true
+        if (generating || !Engine.isLoaded || stillWaiting) return
+        // Tell the model, so it answers with what it has instead of the turn ending silently.
+        messages += UiMessage(Role.TOOL, "The user said no to: ${p.action.label}. Don't ask for it again. Answer the user now with what you already found.")
+        stepsLeft = maxOf(stepsLeft, 2)
+        runAgent()
+    }
+
+    // ---- File manager ----
+    var currentDir by mutableStateOf(Environment.getExternalStorageDirectory())
+        private set
+    val entries = mutableStateListOf<File>()
+    var fileMessage by mutableStateOf<String?>(null)
+    var editingFile by mutableStateOf<File?>(null)
+        private set
+    var editorText by mutableStateOf("")
+    var editorReadOnly by mutableStateOf(false)
+        private set
+
+    fun refreshFiles() {
+        val list = currentDir.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        entries.clear()
+        if (list != null) entries.addAll(list)
+    }
+
+    fun openDir(dir: File) {
+        currentDir = dir
+        refreshFiles()
+    }
+
+    fun goUp(): Boolean {
+        val root = Environment.getExternalStorageDirectory()
+        val parent = currentDir.parentFile
+        if (currentDir == root || parent == null) return false
+        openDir(parent)
+        return true
+    }
+
+    private fun fileOp(block: () -> String) {
+        fileMessage = try { block() } catch (e: Exception) { "Error: ${e.message}" }
+        refreshFiles()
+    }
+
+    fun createFile(name: String) = fileOp {
+        val f = File(currentDir, name.trim())
+        if (f.exists()) "${f.name} already exists" else if (f.createNewFile()) "Created ${f.name}" else "Couldn't create ${f.name}"
+    }
+
+    fun createFolder(name: String) = fileOp {
+        val f = File(currentDir, name.trim())
+        if (f.mkdirs()) "Created folder ${f.name}" else "Couldn't create ${f.name}"
+    }
+
+    fun rename(file: File, newName: String) = fileOp {
+        val target = File(file.parentFile, newName.trim())
+        if (target.exists()) "${target.name} already exists"
+        else if (file.renameTo(target)) "Renamed to ${target.name}" else "Couldn't rename ${file.name}"
+    }
+
+    fun delete(file: File) = fileOp {
+        if (file.deleteRecursively()) "Deleted ${file.name}" else "Couldn't delete ${file.name}"
+    }
+
+    fun openEditor(file: File) {
+        editorReadOnly = false
+        editorText = when {
+            file.length() > 512 * 1024 -> { editorReadOnly = true; "File is too large to edit here (${file.length() / 1024} KB)." }
+            else -> try {
+                val bytes = file.readBytes()
+                if (bytes.take(4000).any { it == 0.toByte() }) {
+                    editorReadOnly = true
+                    "This looks like a binary file and can't be shown as text."
+                } else String(bytes, Charsets.UTF_8)
+            } catch (e: Exception) {
+                editorReadOnly = true
+                "Couldn't open: ${e.message}"
+            }
+        }
+        editingFile = file
+    }
+
+    fun saveEditor() {
+        val f = editingFile ?: return
+        if (editorReadOnly) return
+        fileOp { f.writeText(editorText); "Saved ${f.name}" }
+    }
+
+    fun closeEditor() {
+        editingFile = null
+        editorText = ""
+    }
+
+    // ---- Background work + saved chat ----
+    var runningCode by mutableStateOf(false)
+        private set
+    private val chatFile get() = File(getApplication<Application>().filesDir, "chat.json")
+
+    /** Saves the conversation so it survives the app being closed or restarted. */
+    fun saveChat() {
+        val arr = JSONArray()
+        for (m in messages) {
+            if (m.role == Role.ASSISTANT && m.text.isBlank()) continue
+            arr.put(JSONObject().apply {
+                put("role", m.role.name)
+                put("text", m.text)
+                m.modelText?.let { put("model", it) }
+                m.stats?.let { put("stats", it) }
+            })
+        }
+        try { chatFile.writeText(arr.toString()) } catch (_: Exception) {}
+    }
+
+    private fun loadChat() {
+        try {
+            if (!chatFile.exists()) return
+            val arr = JSONArray(chatFile.readText())
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val role = runCatching { Role.valueOf(o.getString("role")) }.getOrNull() ?: continue
+                val m = UiMessage(role, o.getString("text"), if (o.has("model")) o.getString("model") else null)
+                if (o.has("stats")) m.stats = o.getString("stats")
+                messages += m
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun watchBackgroundWork() {
+        viewModelScope.launch {
+            snapshotFlow {
+                val dl = downloads.values.filter { it.error == null }
+                when {
+                    generating -> "Thinking…"
+                    runningCode -> "Running code…"
+                    loading -> "Loading model…"
+                    dl.isNotEmpty() -> {
+                        val d = dl.first()
+                        val pct = if (d.total > 0) (d.done * 100 / d.total).toInt() else 0
+                        "Downloading ${d.file.fileName} · $pct%"
+                    }
+                    else -> null
+                }
+            }.distinctUntilChanged().collect { status ->
+                val app = getApplication<Application>()
+                if (status != null) WorkService.start(app, status) else WorkService.stop(app)
+            }
+        }
+    }
+
+    init {
+        WebBrowser.init(app)
+        if (useCloud && !prefs.getString("cloudModel", "").isNullOrBlank() && cloudKey.isNotBlank()) {
+            CloudEngine.configure(cloudBase, cloudKey, prefs.getString("cloudModel", "")!!, prefs.getInt("cloudCtx", 8192))
+            CloudEngine.ready = true
+            loadedModel = "☁ " + CloudEngine.model.substringAfterLast('/')
+        }
+        SpaceEngine.onStatus = { msg -> viewModelScope.launch { spaceMessage = msg; if (msg != null) engineMessage = msg } }
+        if (useSpace) {
+            SpaceEngine.token = hfToken
+            SpaceEngine.ready = true
+            loadedModel = "🤗 " + SpaceEngine.MODEL
+        }
+        HordeEngine.onStatus = { msg -> viewModelScope.launch { hordeMessage = msg; if (msg != null) engineMessage = msg } }
+        // AI Horde's models didn't stay uncensored, so the app no longer offers it: switch it off if it was on.
+        if (useHorde) {
+            useHorde = false; prefs.edit().putBoolean("useHorde", false).apply()
+        }
+        if (useHorde && !prefs.getString("hordeModel", "").isNullOrBlank()) {
+            HordeEngine.configure(prefs.getString("hordeModel", "")!!, hordeKey, prefs.getInt("hordeCtx", 4096), prefs.getInt("hordeReply", 512))
+            HordeEngine.ready = true
+            loadedModel = "🌐 " + HordeEngine.model.substringAfterLast('/')
+        } else if (useRemote && remoteUrl.isNotBlank()) {
+            RemoteEngine.configure(remoteUrl, remoteKey, prefs.getString("remoteModel", "") ?: "", prefs.getInt("remoteCtx", 8192))
+            RemoteEngine.ready = true
+            loadedModel = remoteName()
+        }
+        refreshPermission()
+        refreshModels()
+        device = store.deviceInfo()
+        refreshTermux()
+        loadChat()
+        watchBackgroundWork()
+    }
+
+    /** Heuristic: real replies are mostly letters and spaces; broken models emit digits and symbols. */
+    private fun looksBroken(text: String): Boolean {
+        if (text.length < 40) return false
+        val prose = text.replace(Regex("```[\\s\\S]*?(```|$)"), "")
+        if (prose.length < 40) return false
+        val letters = prose.count { it.isLetter() || it == ' ' }
+        return letters.toDouble() / prose.length < 0.55
+    }
+}

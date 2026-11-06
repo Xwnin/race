@@ -1,0 +1,20 @@
+name: Scan cloud aggregators for uncensored models
+
+# Read-only: reads public model catalogs, no keys.
+on:
+  push:
+    paths:
+      - "remote/scan_aggregators.py"
+      - ".github/workflows/scan-aggregators.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -u remote/scan_aggregators.py
