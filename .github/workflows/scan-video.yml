@@ -12,9 +12,13 @@ permissions:
   contents: read
 
 jobs:
-  scan:
+  try:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        space: ["Lightricks/ltx-video-distilled", "doxaras/ltx-video-generator", "rtrm/Wan2.1"]
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -u remote/scan_video.py
+      - run: python3 -u remote/try_video.py "${{ matrix.space }}"
