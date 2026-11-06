@@ -26,8 +26,8 @@ import subprocess
 import modal
 
 GPU = os.environ.get("LF_GPU", "L4")
-MODEL_REPO = os.environ.get("LF_MODEL_REPO", "bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF")
-QUANT = os.environ.get("LF_QUANT", "Q4_K_M")
+MODEL_REPO = os.environ.get("LF_MODEL_REPO", "mradermacher/Huihui-Qwen3.6-35B-A3B-abliterated-GGUF")
+QUANT = os.environ.get("LF_QUANT", "IQ4_XS")
 CTX = int(os.environ.get("LF_CTX", "16384"))
 SCALEDOWN = int(os.environ.get("LF_SCALEDOWN", "120"))
 PORT = 8080

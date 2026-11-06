@@ -14,10 +14,10 @@ on:
         options: [L4, T4, A10, L40S, A100-80GB]
       model_repo:
         description: "Hugging Face GGUF repo (must be abliterated / uncensored)"
-        default: "bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF"
+        default: "mradermacher/Huihui-Qwen3.6-35B-A3B-abliterated-GGUF"
       quant:
         description: "Quantization"
-        default: "Q4_K_M"
+        default: "IQ4_XS"
       ctx:
         description: "Context size in tokens"
         default: "16384"
