@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - "remote/scan_aggregators.py"
+      - "remote/scan_spaces.py"
+      - "remote/probe_nokey.py"
       - ".github/workflows/scan-aggregators.yml"
   workflow_dispatch:
 
@@ -14,7 +16,8 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -u remote/scan_aggregators.py
+      - run: python3 -u remote/probe_nokey.py
+      - run: python3 -u remote/scan_spaces.py

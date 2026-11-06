@@ -37,7 +37,7 @@ def check(sid):
     if NOT_TEXT.search(names) or not GOOD.search(names):
         return None
     b = size(names)
-    if b < 85:
+    if b < 20:
         return None
     rt = get(f"https://huggingface.co/api/spaces/{sid}/runtime") or {}
     hw = (rt.get("hardware") or {}).get("current")
