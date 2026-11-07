@@ -39,22 +39,24 @@ its full system prompt, tool results, progress notes, history cuts and nudges su
 An episode is only kept if the site's own state shows the task was really done (basket, form, inbox) and the
 final answer is right. Half the episodes include the short planning thought the app asks for on website tasks.
 
-## Run it
-1. Record (any PC with LocalForge's source and Chrome/Edge; about 30 s per episode):
-   ```
-   python finetune/record.py --app C:\Users\Big_P\Projects\LocalForge-src --out finetune/data/train.jsonl --episodes 450
-   python finetune/record.py --app C:\Users\Big_P\Projects\LocalForge-src --out finetune/data/heldout.jsonl --episodes 30 --seed 999
-   ```
-   The repo already has a recorded set in `data/train.jsonl.gz` and `data/heldout.jsonl.gz`.
-2. Train, export and check on Modal (your account; roughly $3-5 of the free credit on an L40S):
-   ```
-   pip install modal && modal setup        # once
-   modal run finetune/modal_train.py
-   modal volume get localforge-finetune lf-browser/gguf/ .
-   ```
-3. Copy the `.gguf` files into `%LOCALAPPDATA%\LocalForge\models`, load the model, and run LocalForge's own browser test:
-   `LocalForge.exe --browser-eval "%LOCALAPPDATA%\LocalForge\models\Qwen3.5-9B-abliterated-LocalForge-Browser-Q4_K_M.gguf"`.
-   Run it again on the HauhauCS 9B to compare.
+## Run it (everything on the PC)
+Training runs in WSL2 Ubuntu on the RTX 3070. Close LocalForge first so all 8 GB of video memory are free.
+1. One-time setup (Python GPU tools, plus llama.cpp's converter at LocalForge's build b10549):
+   `wsl -u root bash finetune/local/setup_wsl.sh`
+2. Quick test, about 15 min (GPU memory and speed): `wsl bash finetune/local/run_wsl.sh test`
+3. Training (several hours; if it stops, run it again and it carries on): `wsl bash finetune/local/run_wsl.sh train`
+4. GGUF export (Q4_K_M, Q5_K_M and the mmproj vision file), copied straight into LocalForge's models folder:
+   `wsl bash finetune/local/run_wsl.sh export`
+5. Compare it with LocalForge's own browser test, then run the same test on the HauhauCS 9B:
+   `LocalForge.exe --browser-eval "%LOCALAPPDATA%\LocalForge\models\Qwen3.5-9B-abliterated-LocalForge-Browser-Q4_K_M.gguf"`
+   `check_model.py` also checks held-out steps and the five refusal prompts with LocalForge's llama-server.
 
-`train.py` also runs on its own on any CUDA GPU: `python finetune/train.py --qlora`.
-`check_model.py` runs held-out steps and the five refusal prompts against a GGUF with llama-server.
+**How it fits in 8 GB:** the model is loaded in 4-bit (QLoRA). The 2 GB embedding table and the vision tower stay in
+system RAM, and the output layer is 4-bit too. Logits are only computed where there's a loss.
+Each website task is trained as one sequence: the app's last call of the episode, with the loss on every reply
+in it, plus the planning steps where the app asked for thinking. That's 665 sequences and 3.4M tokens per epoch,
+about 5x less compute than one sequence per call. The adapter is merged one safetensors shard at a time, so
+16 GB of RAM is enough.
+
+To record more data: `python finetune/record.py --app C:\Users\Big_P\Projects\LocalForge-src --out finetune/data/more.jsonl --episodes 200 --seed 7`
+(Chrome or Edge is needed, and each episode takes about 30 s).
