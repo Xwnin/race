@@ -1,4 +1,4 @@
-"""Quick checks of a fine-tuned GGUF with llama-server (LocalForge's own engines\llama-server.exe works):
+"""Quick checks of a fine-tuned GGUF with llama-server (LocalForge's own engines/llama-server.exe works):
 
 1. Held-out website steps (recorded with seeds the training never saw): does the model answer with the same kind
    of LocalForge action as the perfect solver (<js>, <fill>, <click text>, <network>...), and are its tags well formed?
