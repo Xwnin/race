@@ -36,6 +36,8 @@ private data class TermuxLang(val file: String, val command: String, val pkg: St
 object CodeRunner {
     private const val TIMEOUT_SEC = 30
     private const val COMPILE_TIMEOUT_SEC = 120
+    /** Bash in Termux runs installed tools (REA and other GitHub repos), which can take minutes. */
+    private const val TOOL_TIMEOUT_SEC = 300
     private const val MAX_OUTPUT = 6000
     private val dispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
 
@@ -122,7 +124,11 @@ object CodeRunner {
             command = "java $cls.java"
         }
         File(dir, fileName).writeText(code)
-        val timeout = if (lang in setOf("c", "cpp", "go", "rust", "kotlin", "java", "typescript")) COMPILE_TIMEOUT_SEC else TIMEOUT_SEC
+        val timeout = when (lang) {
+            "bash" -> TOOL_TIMEOUT_SEC
+            in setOf("c", "cpp", "go", "rust", "kotlin", "java", "typescript") -> COMPILE_TIMEOUT_SEC
+            else -> TIMEOUT_SEC
+        }
         val script = "cd '${dir.absolutePath}' && timeout ${timeout}s bash -c ${shellQuote(command)}"
         val r = TermuxBridge.run(context, script, dir.absolutePath, (timeout + 15) * 1000L)
             ?: return RunResult(lang, false, true, "[No answer from Termux after ${timeout + 15}s. Open Termux once, then try again.]")

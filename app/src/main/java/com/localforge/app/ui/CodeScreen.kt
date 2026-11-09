@@ -376,6 +376,7 @@ private fun CodeBlock(seg: Segment.Code, onSave: (Segment.Code) -> Unit, onRun: 
 private fun ActionCard(vm: AppViewModel, p: PendingAction) {
     val danger = p.action is FileAction.Delete
     val isRun = p.action is FileAction.Run
+    val isInstall = p.action is FileAction.Install
     val isWeb = p.action is FileAction.Browser || p.action is FileAction.Batch
     Column(
         Modifier
@@ -387,6 +388,7 @@ private fun ActionCard(vm: AppViewModel, p: PendingAction) {
     ) {
         Text(
             if (danger) "⚠️ Assistant wants to delete" else if (isRun) "▶ Assistant wants to run this code"
+            else if (isInstall) "📦 Assistant wants to install a GitHub repo"
             else if (isWeb) "🖱 Assistant wants to do this on the page" else "Assistant wants to change files",
             color = if (danger) C.Bad else C.Accent, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
         )
@@ -411,7 +413,7 @@ private fun ActionCard(vm: AppViewModel, p: PendingAction) {
                 Button(
                     onClick = { vm.approve(p) },
                     colors = ButtonDefaults.buttonColors(containerColor = if (danger) C.Bad else C.Accent)
-                ) { Text(if (danger) "Delete" else if (isRun) "Run" else if (isWeb) "Do it" else "Approve") }
+                ) { Text(if (danger) "Delete" else if (isRun) "Run" else if (isInstall) "Install" else if (isWeb) "Do it" else "Approve") }
                 OutlinedButton(onClick = { vm.reject(p) }) { Text("Skip") }
             }
             ActionStatus.DONE -> Text("✓ ${p.result ?: "Working…"}", color = C.Good, fontSize = 13.sp)

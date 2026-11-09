@@ -60,7 +60,16 @@ jobs:
       - name: Rename APK
         run: cp app/build/outputs/apk/cloud/release/app-cloud-release.apk LocalForge-Cloud.apk
 
+      # Only main replaces the download link; other branches keep their APK as a workflow artifact.
+      - name: Upload branch APK
+        if: github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalForge-Cloud-${{ github.ref_name }}
+          path: LocalForge-Cloud.apk
+
       - name: Publish LocalForge Cloud release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cloud-latest

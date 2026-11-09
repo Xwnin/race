@@ -1,6 +1,7 @@
 package com.localforge.app
 
 import android.app.Application
+import com.localforge.app.agent.GitHubTools
 import com.localforge.app.autopilot.Autopilot
 import com.localforge.app.autopilot.AutopilotService
 
@@ -16,6 +17,7 @@ class LocalForgeApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        GitHubTools.init(this)
         if (BuildConfig.AUTOPILOT) {
             Autopilot.init(this)
             // Android restarted the app (not the phone) while a task was running: carry on by itself.

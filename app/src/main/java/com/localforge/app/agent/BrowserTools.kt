@@ -26,7 +26,7 @@ object BrowserTools {
     /** Small tag typos like <search query="..."] or <browse url="..."> */
     private val sloppy = Regex("""(<(?:search|browse|goto|navigate|fetch|extract|click|press|scroll)\b[^<>\n]*?")\s*[\]>)]""", opt)
 
-    val anyTag = Regex("""<(search|browse|fetch|extract|click|type|press|scroll|page|js|run|write|read|list|find)\b""", opt)
+    val anyTag = Regex("""<(search|browse|fetch|extract|click|type|press|scroll|page|js|run|write|read|list|find|github|install|learn)\b""", opt)
 
     fun prompt(): String = """
 YOU HAVE YOUR OWN WEB BROWSER (the user watches it live in the Browser tab and stays logged in to sites there).
