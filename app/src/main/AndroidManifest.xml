@@ -17,6 +17,8 @@
 
     <!-- Lets LocalForge send code to Termux to compile and run (C, C++, Java, Go, Rust, ...) -->
     <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <!-- "Set up Termux for me": opens Android's installer for the Termux APK it downloaded from GitHub -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <queries>
         <package android:name="com.termux" />

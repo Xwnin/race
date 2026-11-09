@@ -111,7 +111,7 @@ object GitHubTools {
     /** Installs [repoInput] inside Termux and remembers it. Returns the report for the model. */
     suspend fun install(ctx: Context, repoInput: String): Pair<Boolean, String> {
         val repo = RepoLogic.parseRepo(repoInput) ?: return false to "\"$repoInput\" isn't a GitHub repo (write owner/name)."
-        if (!TermuxBridge.isInstalled(ctx)) return false to "Installing repos needs Termux, which isn't installed. The user can set it up on the Home tab (Code runners), then ask again."
+        if (!TermuxBridge.isInstalled(ctx)) return false to "Installing repos needs Termux, which isn't installed. Tell the user to tap \"Set up Termux automatically\" on the Home tab (Code runners), then ask again."
         if (!TermuxBridge.hasPermission(ctx)) return false to "LocalForge isn't allowed to use Termux yet. The user taps \"Allow\" on the Home tab → Code runners, then asks again."
         val home = "/data/data/com.termux/files/home"
         val r = TermuxBridge.run(ctx, RepoLogic.fullScript(repo), home, INSTALL_TIMEOUT_MS)

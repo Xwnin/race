@@ -20,6 +20,7 @@ import com.localforge.app.agent.CodeRunner
 import com.localforge.app.agent.FileIndex
 import com.localforge.app.agent.TermuxBridge
 import com.localforge.app.agent.GitHubTools
+import com.localforge.app.agent.TermuxSetup
 import com.localforge.app.agent.BrowserTools
 import com.localforge.app.agent.WebBrowser
 import com.localforge.app.agent.FileAction
@@ -906,6 +907,60 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 "python", "javascript", "typescript", "html", "sql", "shell", "lua", "ruby",
                 "php (basic: no printf)", "c / cpp (simple interpreter: use arrays, printf and cout only — no vector, map or std::string)"
             )
+        }
+    }
+
+    // ---- "Set up Termux for me" ----
+    /** Download progress of the Termux APK (0..100), or null when not downloading. */
+    var termuxDownload by mutableStateOf<Int?>(null)
+        private set
+    /** Termux accepted a command from LocalForge (the pasted line ran). */
+    var termuxAnswers by mutableStateOf(false)
+        private set
+    /** The packages are being installed through Termux. */
+    var termuxInstalling by mutableStateOf(false)
+        private set
+    var termuxSetupDone by mutableStateOf(prefs.getBoolean("termuxSetupDone", false))
+        private set
+
+    /** Downloads the Termux APK; [then] gets it to open Android's installer. */
+    fun downloadTermux(then: (File) -> Unit) {
+        if (termuxDownload != null) return
+        viewModelScope.launch {
+            termuxDownload = 0
+            runnerMessage = "Downloading Termux from GitHub…"
+            try {
+                val apk = TermuxSetup.download(getApplication<Application>()) { termuxDownload = it }
+                runnerMessage = "Downloaded. Tap Install on the next screen, then come back here."
+                then(apk)
+            } catch (e: Exception) {
+                runnerMessage = "Couldn't download Termux: ${e.message}. Use \"Get\" in the manual steps instead."
+            } finally {
+                termuxDownload = null
+            }
+        }
+    }
+
+    /** Checks Termux answers, then installs all packages through it. */
+    fun finishTermuxSetup() {
+        if (termuxInstalling) return
+        viewModelScope.launch {
+            val ctx = getApplication<Application>()
+            refreshTermux()
+            runnerMessage = "Checking that Termux answers…"
+            val (ok, msg) = TermuxSetup.answers(ctx)
+            termuxAnswers = ok
+            if (!ok) { runnerMessage = msg; return@launch }
+            termuxInstalling = true
+            runnerMessage = "Installing compilers, Node, git and Python in Termux (about 10 minutes, ~2 GB). You can leave this screen."
+            try {
+                val (done, out) = TermuxSetup.installPackages(ctx)
+                termuxSetupDone = done
+                prefs.edit().putBoolean("termuxSetupDone", done).apply()
+                runnerMessage = (if (done) "Termux is set up!\n" else "Some packages didn't install:\n") + out
+            } finally {
+                termuxInstalling = false
+            }
         }
     }
 

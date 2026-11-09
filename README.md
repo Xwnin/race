@@ -21,4 +21,6 @@ The assistant can learn and install public GitHub repos by itself, then use them
 [REA (Reverse Engineer Anything)](https://github.com/morluto/rea) is built in: the app knows how to install it
 (`npm install -g rea-agents` with a Node version REA accepts) and how to use it on APKs, JS/Electron apps, saved
 `.har` network captures, model files and other binaries. Ask e.g. *"Use REA to tell me how this APK is signed:
-/sdcard/Download/app.apk"*. Termux must be set up first (Home tab → Code runners).
+/sdcard/Download/app.apk"*. Termux must be set up first: Home tab → Code runners → **Set up Termux automatically**. It downloads and
+installs Termux from GitHub, asks for the permission, and installs all the packages. You paste one line into Termux
+once, because Android doesn't let one app change another app's settings.

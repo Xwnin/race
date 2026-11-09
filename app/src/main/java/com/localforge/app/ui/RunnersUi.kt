@@ -23,7 +23,9 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -46,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.localforge.app.AppViewModel
 import com.localforge.app.agent.TermuxBridge
+import com.localforge.app.agent.TermuxSetup
 import java.io.File
 
 /** Home-tab card: which languages can run, and guided Termux setup for the rest. */
@@ -72,9 +75,13 @@ fun CodeRunnersCard(vm: AppViewModel) {
             else "PHP, C and C++ run in simple built-in interpreters. Optional: connect Termux for Java, Kotlin, Go, Rust and full C/C++ compilers.",
             color = if (ready) C.Good else C.Muted, fontSize = 13.sp
         )
+        if (!vm.termuxSetupDone) {
+            Spacer(Modifier.height(8.dp))
+            AutoSetup(vm) { permission.launch(TermuxBridge.PERMISSION) }
+        }
         var showSetup by remember { mutableStateOf(false) }
         if (!ready) {
-            TextButton(onClick = { showSetup = !showSetup }) { Text(if (showSetup) "Hide Termux setup" else "Show optional Termux setup") }
+            TextButton(onClick = { showSetup = !showSetup }) { Text(if (showSetup) "Hide manual steps" else "Show manual Termux steps") }
         }
         if (ready || !showSetup) {
             vm.runnerMessage?.let {
@@ -107,6 +114,59 @@ fun CodeRunnersCard(vm: AppViewModel) {
         vm.runnerMessage?.let {
             Spacer(Modifier.height(6.dp))
             Text(it, color = C.Text, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+        }
+    }
+}
+
+/** One button that does the next Termux setup step for you. */
+@Composable
+private fun AutoSetup(vm: AppViewModel, askPermission: () -> Unit) {
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(C.CardInner).padding(12.dp)
+    ) {
+        Text("Set up Termux automatically", color = C.Text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+        Text(
+            "Needed for GitHub tools like REA, and for Java, Kotlin, Go and Rust.",
+            color = C.Muted, fontSize = 12.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        val dl = vm.termuxDownload
+        when {
+            dl != null -> {
+                Text("Downloading Termux… $dl%", color = C.Text, fontSize = 13.sp)
+                LinearProgressIndicator(progress = { dl / 100f }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+            }
+            !vm.termuxInstalled -> Button(onClick = {
+                if (!TermuxSetup.canInstall(ctx)) {
+                    vm.runnerMessage = "Turn on \"Allow from this source\" for LocalForge, come back, and tap the button again."
+                    ctx.startActivity(TermuxSetup.unknownAppsSettings(ctx))
+                } else vm.downloadTermux { apk -> ctx.startActivity(TermuxSetup.installIntent(ctx, apk)) }
+            }) { Text("1/3 · Download and install Termux") }
+            !vm.termuxAllowed -> Button(onClick = askPermission) { Text("2/3 · Allow LocalForge to use Termux") }
+            vm.termuxInstalling -> {
+                Text("3/3 · Installing packages in Termux…", color = C.Text, fontSize = 13.sp)
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+            }
+            else -> {
+                if (!vm.termuxAnswers) {
+                    Text(
+                        "3/3 · Android doesn't let one app change another's settings, so this needs you once: tap the " +
+                            "button, then in Termux long-press → Paste → Enter, and tap Allow for storage. Then come back.",
+                        color = C.Text, fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = {
+                        clipboard.setText(AnnotatedString(TermuxSetup.PASTE_COMMAND))
+                        vm.runnerMessage = "Line copied. Paste it in Termux, press Enter, then come back and tap Finish setup."
+                        TermuxSetup.openTermux(ctx)?.let { ctx.startActivity(it) }
+                    }) { Text("Copy the line and open Termux") }
+                }
+                Button(onClick = { vm.finishTermuxSetup() }) {
+                    Text(if (vm.termuxAnswers) "Try installing the packages again" else "I pasted it · Finish setup")
+                }
+            }
         }
     }
 }
