@@ -19,6 +19,8 @@ import androidx.lifecycle.viewModelScope
 import com.localforge.app.agent.CodeRunner
 import com.localforge.app.agent.FileIndex
 import com.localforge.app.agent.TermuxBridge
+import com.localforge.app.agent.GitHubTools
+import com.localforge.app.agent.TermuxSetup
 import com.localforge.app.agent.BrowserTools
 import com.localforge.app.agent.WebBrowser
 import com.localforge.app.agent.FileAction
@@ -908,6 +910,60 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---- "Set up Termux for me" ----
+    /** Download progress of the Termux APK (0..100), or null when not downloading. */
+    var termuxDownload by mutableStateOf<Int?>(null)
+        private set
+    /** Termux accepted a command from LocalForge (the pasted line ran). */
+    var termuxAnswers by mutableStateOf(false)
+        private set
+    /** The packages are being installed through Termux. */
+    var termuxInstalling by mutableStateOf(false)
+        private set
+    var termuxSetupDone by mutableStateOf(prefs.getBoolean("termuxSetupDone", false))
+        private set
+
+    /** Downloads the Termux APK; [then] gets it to open Android's installer. */
+    fun downloadTermux(then: (File) -> Unit) {
+        if (termuxDownload != null) return
+        viewModelScope.launch {
+            termuxDownload = 0
+            runnerMessage = "Downloading Termux from GitHub…"
+            try {
+                val apk = TermuxSetup.download(getApplication<Application>()) { termuxDownload = it }
+                runnerMessage = "Downloaded. Tap Install on the next screen, then come back here."
+                then(apk)
+            } catch (e: Exception) {
+                runnerMessage = "Couldn't download Termux: ${e.message}. Use \"Get\" in the manual steps instead."
+            } finally {
+                termuxDownload = null
+            }
+        }
+    }
+
+    /** Checks Termux answers, then installs all packages through it. */
+    fun finishTermuxSetup() {
+        if (termuxInstalling) return
+        viewModelScope.launch {
+            val ctx = getApplication<Application>()
+            refreshTermux()
+            runnerMessage = "Checking that Termux answers…"
+            val (ok, msg) = TermuxSetup.answers(ctx)
+            termuxAnswers = ok
+            if (!ok) { runnerMessage = msg; return@launch }
+            termuxInstalling = true
+            runnerMessage = "Installing compilers, Node, git and Python in Termux (about 10 minutes, ~2 GB). You can leave this screen."
+            try {
+                val (done, out) = TermuxSetup.installPackages(ctx)
+                termuxSetupDone = done
+                prefs.edit().putBoolean("termuxSetupDone", done).apply()
+                runnerMessage = (if (done) "Termux is set up!\n" else "Some packages didn't install:\n") + out
+            } finally {
+                termuxInstalling = false
+            }
+        }
+    }
+
     /** Quick check that Termux answers and which compilers are installed. */
     fun testTermux() {
         viewModelScope.launch {
@@ -1094,6 +1150,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
+    /** Installs a GitHub repo through Termux and adds the report to the chat. */
+    private suspend fun executeInstall(a: FileAction.Install, p: PendingAction?) {
+        val out = UiMessage(Role.RUN, "Installing ${a.path} in Termux… (this can take several minutes)")
+        messages += out
+        runningCode = true
+        val (ok, report) = try {
+            GitHubTools.install(getApplication<Application>(), a.path)
+        } catch (e: Exception) {
+            false to "Installing ${a.path} failed: ${e.message}"
+        } finally {
+            runningCode = false
+        }
+        out.text = (if (ok) "✓ Installed " else "✗ Couldn't install ") + a.path + "\n" + report.substringAfter("```\n", "").substringBefore("\n```").takeLast(1500)
+        out.modelTextOverride = report
+        ranCode = true
+        p?.result = if (ok) "Installed" else "Failed — see output"
+    }
+
     // ---- Per-request agent state (mirrors the desktop app) ----
     private var totalSteps = 0
     private var repeats = 0
@@ -1123,7 +1197,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "population|market cap|sorted?|how many)\\b", RegexOption.IGNORE_CASE
     )
     private val navAsk = Regex("\\b(open|click|go to|go into|navigate|visit|switch to|press)\\b", RegexOption.IGNORE_CASE)
-    private val tagAny = Regex("<(write|run|type|js)\\b[\\s\\S]*?(</\\1>|$)|<[a-z]+\\b[^>]*/?>", RegexOption.IGNORE_CASE)
+    private val tagAny = Regex("<(write|run|type|js|learn)\\b[\\s\\S]*?(</\\1>|$)|<[a-z]+\\b[^>]*/?>", RegexOption.IGNORE_CASE)
     private val claims = Regex(
         "ran successfully|run successfully|executed successfully|(saved|written|created) (it |the file |the csv |successfully)|tests? (all )?pass",
         RegexOption.IGNORE_CASE
@@ -1540,6 +1614,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             continue
                         }
+                        if (a is FileAction.Repo || a is FileAction.Learn) {
+                            // GitHub reads and the AI's own notes need no file access.
+                            val key = "github|${a.path}|" + ((a as? FileAction.Repo)?.file ?: "")
+                            if (a is FileAction.Repo && key in doneLookups) {
+                                repeats++
+                                results += "You already read this (${a.label}) and got it above. Use it: install the repo, read another file, or answer the user."
+                            } else {
+                                results += withContext(Dispatchers.IO) { FileTools.execute(a) }
+                                if (a is FileAction.Repo) doneLookups += key
+                                else reply.actions += PendingAction(a).also { it.status = ActionStatus.DONE; it.result = "Saved" }
+                            }
+                            continueLoop = true
+                            continue
+                        }
                         if (a.readOnly) {
                             results += if (!hasFileAccess) "No file access yet: the user must allow all-files access on the Home tab."
                             else withContext(Dispatchers.IO) { FileTools.execute(a) }
@@ -1554,11 +1642,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         val p = PendingAction(a)
                         reply.actions += p
-                        if (a is FileAction.Run && autoApprove) {
+                        if (a is FileAction.Install && autoApprove) {
+                            p.status = ActionStatus.DONE
+                            executeInstall(a, p)
+                            continueLoop = true
+                        } else if (a is FileAction.Run && autoApprove) {
                             p.status = ActionStatus.DONE
                             executeRun(a, p)
                             continueLoop = true
-                        } else if (a !is FileAction.Run && autoApprove && a !is FileAction.Delete && hasFileAccess) {
+                        } else if (a !is FileAction.Run && a !is FileAction.Install && autoApprove && a !is FileAction.Delete && hasFileAccess) {
                             p.status = ActionStatus.DONE
                             val r = withContext(Dispatchers.IO) { FileTools.execute(a) }
                             p.result = r
@@ -1600,7 +1692,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val outs = mutableListOf<String>()
         for (q in p.queued) {
             if (q is FileAction.Browser && q.browserRead) outs += browserStep(q)
-            else if (q.readOnly && hasFileAccess) outs += withContext(Dispatchers.IO) { FileTools.execute(q) }
+            else if (q.readOnly && (hasFileAccess || q is FileAction.Repo || q is FileAction.Learn)) outs += withContext(Dispatchers.IO) { FileTools.execute(q) }
             else { outs += "Not done yet: ${q.label}. Ask for it again if you still need it."; break }
         }
         p.queued = emptyList()
@@ -1623,6 +1715,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             p.status = ActionStatus.DONE
             viewModelScope.launch {
                 executeRun(a, p)
+                afterCard(p)
+            }
+            return
+        }
+        if (a is FileAction.Install) {
+            p.status = ActionStatus.DONE
+            viewModelScope.launch {
+                executeInstall(a, p)
                 afterCard(p)
             }
             return

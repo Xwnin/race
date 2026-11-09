@@ -60,7 +60,21 @@ jobs:
       - name: Rename APK
         run: cp app/build/outputs/apk/cloud/release/app-cloud-release.apk LocalForge-Cloud.apk
 
+      # Only main replaces the main download link. Other branches publish a test build you can download directly:
+      # https://github.com/Xwnin/race/releases/download/cloud-test/LocalForge-Cloud.apk
+      - name: Publish test build (branches)
+        if: github.ref != 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cloud-test
+          name: LocalForge Cloud test build
+          body: Test build from branch ${{ github.ref_name }} (commit ${{ github.sha }}). Download LocalForge-Cloud.apk below.
+          files: LocalForge-Cloud.apk
+          prerelease: true
+          make_latest: false
+
       - name: Publish LocalForge Cloud release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cloud-latest

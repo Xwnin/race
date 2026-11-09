@@ -68,6 +68,21 @@ sealed class FileAction {
         override val readOnly = false
         override val label get() = "Do ${steps.size} browser steps: " + steps.joinToString("; ") { it.label }.take(300)
     }
+    /** Read a GitHub repo ([path] = owner/name), or one [file] or folder in it. Runs by itself. */
+    data class Repo(override val path: String, val file: String = "") : FileAction() {
+        override val readOnly = true
+        override val label get() = if (file.isBlank()) "Read GitHub repo $path" else "Read $file in GitHub repo $path"
+    }
+    /** Install a GitHub repo ([path] = owner/name) on the phone through Termux. Asks first. */
+    data class Install(override val path: String) : FileAction() {
+        override val readOnly = false
+        override val label get() = "Install GitHub repo $path on the phone (Termux)"
+    }
+    /** Save the AI's own notes on how to use a repo. Only touches LocalForge's own data, so it runs by itself. */
+    data class Learn(override val path: String, val notes: String) : FileAction() {
+        override val readOnly = true
+        override val label get() = "Remember how to use $path"
+    }
     /** Run code on the phone. [path] holds the language ("python" or "shell"). */
     data class Run(override val path: String, val code: String) : FileAction() {
         override val readOnly = false
@@ -80,6 +95,9 @@ object FileTools {
 
     private val simpleTag = Regex("""<(list|read|mkdir|delete)\s+path\s*=\s*"([^"]+)"\s*/?>""", RegexOption.IGNORE_CASE)
     private val findTag = Regex("""<find\s+(?:query|name|q)\s*=\s*"([^"]+)"\s*/?>""", RegexOption.IGNORE_CASE)
+    private val githubTag = Regex("""<github\s+repo\s*=\s*"([^"]+)"(?:\s+(?:file|path)\s*=\s*"([^"]*)")?\s*/?>""", RegexOption.IGNORE_CASE)
+    private val installTag = Regex("""<install\s+repo\s*=\s*"([^"]+)"\s*/?>""", RegexOption.IGNORE_CASE)
+    private val learnTag = Regex("""<learn\s+repo\s*=\s*"([^"]+)"\s*>([\s\S]*?)</learn>""", RegexOption.IGNORE_CASE)
     private val thinkBlock = Regex("<think>[\\s\\S]*?(</think>|$)", RegexOption.IGNORE_CASE)
 
     /** Removes <think>…</think> reasoning blocks that Qwen3-style models print. */
@@ -150,9 +168,11 @@ Top-level folders on this phone: $overview
 
 ${BrowserTools.prompt()}
 
+${GitHubTools.prompt()}
+
 Rules:
 - Always use full paths starting with $workspace
-- After <find>, <run>, <list> or <read>, stop your reply and wait for the result.
+- After <find>, <run>, <list>, <read>, <github> or <install>, stop your reply and wait for the result.
 - If results are already given to you under [Phone files], answer from them directly.
 - Only write, create or delete files when the user asks for it.
 - <write> must contain the entire file, never a partial snippet.
@@ -192,6 +212,15 @@ Rules:
             }
             found += m.range.first to action
         }
+        for (m in githubTag.findAll(reply)) {
+            found += m.range.first to FileAction.Repo(m.groupValues[1].trim(), m.groupValues[2].trim())
+        }
+        for (m in installTag.findAll(reply)) {
+            found += m.range.first to FileAction.Install(m.groupValues[1].trim())
+        }
+        for (m in learnTag.findAll(reply)) {
+            found += m.range.first to FileAction.Learn(m.groupValues[1].trim(), m.groupValues[2].trim())
+        }
         found += BrowserTools.parse(reply)
         val out = mutableListOf<FileAction>()
         for ((_, a) in found.sortedBy { it.first }) {
@@ -226,6 +255,9 @@ Rules:
         val f = File(action.path)
         when (action) {
             is FileAction.Run -> "Run actions are handled by CodeRunner"
+            is FileAction.Install -> "Install actions are handled by GitHubTools.install"
+            is FileAction.Repo -> GitHubTools.read(action.path, action.file)
+            is FileAction.Learn -> GitHubTools.learn(action.path, action.notes)
             is FileAction.Browser, is FileAction.Batch -> "Browser actions are handled by BrowserTools"
             is FileAction.Find -> {
                 val hits = FileIndex.search(action.path, 30)
