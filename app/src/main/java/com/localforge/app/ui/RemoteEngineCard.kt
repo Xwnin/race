@@ -64,7 +64,7 @@ fun RemoteEngineCard(vm: AppViewModel) {
         Text(
             if (on) "${RemoteEngine.model} · ${RemoteEngine.ctx} tokens · " +
                 (if (RemoteEngine.lastTokensPerSecond > 0) "%.0f tokens/s".format(RemoteEngine.lastTokensPerSecond) else "sleeps when idle")
-            else "Run a big uncensored model on your own rented GPU (Modal) instead of this phone. Much faster replies.",
+            else "Use your big uncensored model on Colab (or Modal) instead of this phone.",
             color = C.Muted, fontSize = 13.sp, fontFamily = if (on) FontFamily.Monospace else FontFamily.Default
         )
         if (on && vm.loading) vm.engineMessage?.let { Text(it, color = C.Gold, fontSize = 13.sp) }
@@ -72,7 +72,7 @@ fun RemoteEngineCard(vm: AppViewModel) {
             Spacer(Modifier.height(10.dp))
             OutlinedTextField(
                 value = url, onValueChange = { url = it }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                label = { Text("Address (https://…modal.run)") }, enabled = !on && !vm.remoteBusy
+                label = { Text("Colab code, or an https:// address") }, enabled = !on && !vm.remoteBusy
             )
             Spacer(Modifier.height(6.dp))
             OutlinedTextField(
@@ -107,8 +107,8 @@ fun RemoteEngineCard(vm: AppViewModel) {
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Deploy it with the \"Deploy Modal engine\" workflow in your GitHub repo. The first message after a quiet " +
-                        "spell wakes the GPU (about a minute). Modal bills only while it's awake.",
+                    "Colab: type the notebook's code and your LocalForge key. The app finds Colab's current address by " +
+                        "itself each time, so press Run all in the Colab notebook first. Modal: paste its https:// address.",
                     color = C.Muted, fontSize = 12.sp
                 )
             }
