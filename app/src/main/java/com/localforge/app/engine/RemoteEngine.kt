@@ -120,7 +120,7 @@ object RemoteEngine {
                     val c = open("/health", timeoutMs = 60_000)
                     val code = c.responseCode
                     c.disconnect()
-                    if (code == 200) { lastOk = System.currentTimeMillis(); return@withContext }
+                    if (code == 200) { lastOk = System.currentTimeMillis(); colabIdleRule(); return@withContext }
                     last = "HTTP $code"
                     if (code == 401) throw IllegalStateException("Wrong key: the remote engine refused it.")
                     if (code == 404 && !isColab) throw IllegalStateException("Nothing at $url (HTTP 404). Check the address.")
@@ -182,6 +182,25 @@ object RemoteEngine {
             c.outputStream.use { it.write("{}".toByteArray()) }
             c.responseCode
             c.disconnect()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * The PC's LocalForge can set Colab to "stay on while LocalForge is open" (idle 0), which switches Colab off
+     * 10 minutes after the PC stops pinging, e.g. when the PC is turned off. When the phone finds that rule, it
+     * swaps it for "switch off after 2 hours with no messages", so Colab keeps running for the phone alone.
+     */
+    private fun colabIdleRule() {
+        if (!isColab) return
+        try {
+            val s = open("/status", timeoutMs = 20_000)
+            val idle = JSONObject(readAll(s)).optInt("idleMin", -1); s.disconnect()
+            if (idle == 0) {
+                val c = open("/keepalive", "POST", timeoutMs = 20_000)
+                c.doOutput = true
+                c.outputStream.use { it.write("{\"idle\": 120}".toByteArray()) }
+                c.responseCode; c.disconnect()
+            }
         } catch (_: Exception) {}
     }
 
