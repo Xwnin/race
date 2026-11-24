@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.net.wifi.WifiManager
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
 
@@ -22,6 +23,7 @@ import androidx.core.content.ContextCompat
  */
 class WorkService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -40,12 +42,24 @@ class WorkService : Service() {
                 acquire(3 * 60 * 60 * 1000L) // safety cap: 3 hours
             }
         }
+        // Keep Wi-Fi awake too: a reply from a remote model (Colab) streams in over minutes, and with the screen off
+        // Android may otherwise put Wi-Fi to sleep and cut the connection.
+        if (wifiLock == null) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val mode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = try {
+                wm.createWifiLock(mode, "LocalForge:work").apply { setReferenceCounted(false); acquire() }
+            } catch (_: Exception) { null }
+        }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
         super.onDestroy()
     }
 

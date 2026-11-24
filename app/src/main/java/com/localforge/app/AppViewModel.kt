@@ -1828,6 +1828,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     generating -> "Thinking…"
                     runningCode -> "Running code…"
                     loading -> "Loading model…"
+                    remoteBusy -> "Connecting to the remote model…"
                     dl.isNotEmpty() -> {
                         val d = dl.first()
                         val pct = if (d.total > 0) (d.done * 100 / d.total).toInt() else 0
